@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><title>WGSL compile check</title></head><body><pre id="out">running</pre>
+<script type="module">
+// compiles a dumped WGSL compute shader into a pipeline (no dispatch) and reports whether the device survives: compile-time vs run-time failures
+const out = document.getElementById( 'out' );
+const publish = ( r ) => { window.__gpuTest = { done: true, ...r }; out.textContent = JSON.stringify( r, null, 2 ); };
+const params = new URLSearchParams( location.search );
+try {
+	const code = await ( await fetch( params.get( 'file' ) || '/test/.tmp/shaders/shader-0.wgsl' ) ).text();
+	const adapter = await navigator.gpu.requestAdapter();
+	const device = await adapter.requestDevice( { requiredFeatures: adapter.features.has( 'subgroups' ) ? [ 'subgroups' ] : [] } );
+	let lost = null; device.lost.then( ( i ) => { lost = i.message; } );
+	const t0 = performance.now();
+	const module = device.createShaderModule( { code } );
+	const info = await module.getCompilationInfo();
+	const messages = info.messages.filter( ( m ) => m.type !== 'info' ).map( ( m ) => `${ m.type } ${ m.lineNum }: ${ m.message }` );
+	const tModule = performance.now() - t0;
+	let pipelineError = null;
+	try { await device.createComputePipelineAsync( { layout: 'auto', compute: { module, entryPoint: 'main' } } ); } catch ( e ) { pipelineError = String( e.message ); }
+	const tPipeline = performance.now() - t0 - tModule;
+	await new Promise( ( r ) => setTimeout( r, 1500 ) );
+	publish( { ok: ! lost && ! pipelineError && messages.length === 0, lines: code.split( '\n' ).length, messages, pipelineError, lost, tModuleMs: +tModule.toFixed( 0 ), tPipelineMs: +tPipeline.toFixed( 0 ) } );
+} catch ( e ) { publish( { ok: false, error: String( e.stack || e ) } ); }
+</script></body></html>

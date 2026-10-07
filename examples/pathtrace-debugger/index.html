@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Path Trace Debugger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: inspector rail left, viewport right; stacks on phones. Same system as the meshlet debugger. */
+:root {
+	--bg: #0f1216; --panel: #161b22; --panel-2: #1d242d; --line: #2a333e;
+	--fg: #e6ebf0; --fg-dim: #94a1b0;
+	--accent: #f2b544; --accent-2: #4fb3d9; --danger: #e85d4a; --ok: #5fc98a; --violet: #9a5fd9;
+	--viewport: #0b0e12;
+	--font-ui: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+	--font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+	:root:not([data-theme="dark"]) {
+		--bg: #f3f4f1; --panel: #ffffff; --panel-2: #eef0ec; --line: #d6dad2;
+		--fg: #1c2127; --fg-dim: #5d6873; --accent: #b86f00; --accent-2: #0e7fa6; --danger: #c7382a; --ok: #2d8f5a; --violet: #6f3fb0;
+		--viewport: #e7e9e4; color-scheme: light;
+	}
+}
+:root[data-theme="light"] {
+	--bg: #f3f4f1; --panel: #ffffff; --panel-2: #eef0ec; --line: #d6dad2;
+	--fg: #1c2127; --fg-dim: #5d6873; --accent: #b86f00; --accent-2: #0e7fa6; --danger: #c7382a; --ok: #2d8f5a; --violet: #6f3fb0;
+	--viewport: #e7e9e4; color-scheme: light;
+}
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 var(--font-ui); display: flex; flex-direction: row; min-height: 100%; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+button, select, input { font: inherit; color: inherit; }
+#rail { width: 340px; flex: 0 0 340px; height: 100vh; overflow-y: auto; background: var(--panel); border-right: 1px solid var(--line); padding: 14px 16px calc(24px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+#view { flex: 1 1 auto; position: relative; min-width: 0; min-height: 0; background: var(--viewport); }
+#view canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+h1 { font-size: 15px; font-weight: 600; margin: 0; text-wrap: balance; }
+.sub { color: var(--fg-dim); margin: 2px 0 0; }
+.badge { display: inline-block; font: 500 10.5px/1 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; padding: 4px 6px; border-radius: 3px; background: var(--panel-2); color: var(--fg-dim); border: 1px solid var(--line); }
+.badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--line)); }
+.badge.warn { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
+.badge.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, var(--line)); }
+details { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+details > summary { cursor: pointer; padding: 8px 10px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; user-select: none; }
+details > summary::before { content: ""; width: 6px; height: 6px; border-right: 1.5px solid var(--fg-dim); border-bottom: 1.5px solid var(--fg-dim); transform: rotate(-45deg); transition: transform .15s; margin-left: 2px; }
+details[open] > summary::before { transform: rotate(45deg); }
+details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+.body { padding: 4px 10px 10px; display: flex; flex-direction: column; gap: 8px; }
+.row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; }
+.row label { color: var(--fg-dim); }
+.slider { display: grid; gap: 6px; }
+.slider label { color: var(--fg-dim); display: flex; justify-content: space-between; }
+.slider label .val { font-family: var(--font-mono); color: var(--fg); font-variant-numeric: tabular-nums; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+select, button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; min-height: 30px; }
+button { cursor: pointer; }
+button:hover { border-color: var(--fg-dim); }
+button.on { border-color: var(--accent); color: var(--accent); }
+.btnrow { display: flex; gap: 6px; flex-wrap: wrap; }
+.btnrow > * { flex: 1 1 auto; }
+.check { display: flex; align-items: center; gap: 8px; color: var(--fg-dim); }
+.check input { accent-color: var(--accent); margin: 0; }
+.stats { display: grid; grid-template-columns: 1fr auto; gap: 3px 10px; font-size: 12.5px; margin: 0; }
+.stats dt { color: var(--fg-dim); margin: 0; }
+.stats dd { margin: 0; font-family: var(--font-mono); text-align: right; font-variant-numeric: tabular-nums; }
+.stats dd.hi { color: var(--accent); }
+.stats dd.ok { color: var(--ok); }
+.stats dd.bad { color: var(--danger); }
+.legend { display: flex; gap: 10px; flex-wrap: wrap; color: var(--fg-dim); font-size: 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
+.hint { color: var(--fg-dim); font-size: 12px; margin: 0; }
+code { font-family: var(--font-mono); font-size: 12px; }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 11.5px/1.5 var(--font-mono); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 8px; max-height: 200px; overflow: auto; }
+.meter { height: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; display: flex; }
+.meter i { display: block; height: 100%; }
+#overlay { position: absolute; left: 12px; top: 12px; display: flex; flex-direction: column; gap: 6px; pointer-events: none; }
+#overlay .tag { font: 11.5px/1.3 var(--font-mono); background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; color: var(--fg); backdrop-filter: blur(4px); }
+#status { position: absolute; right: 12px; top: 12px; font: 11.5px var(--font-mono); background: color-mix(in srgb, var(--panel) 82%, transparent); border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; color: var(--fg-dim); }
+#error { position: absolute; inset: auto 12px 12px 12px; background: color-mix(in srgb, var(--danger) 18%, var(--panel)); border: 1px solid var(--danger); border-radius: 6px; padding: 10px 12px; font: 12px/1.5 var(--font-mono); white-space: pre-wrap; max-height: 40%; overflow: auto; }
+@media (max-width: 820px) {
+	body { flex-direction: column-reverse; }
+	#rail { width: auto; flex: 1 1 auto; height: auto; border-right: 0; border-top: 1px solid var(--line); }
+	#view { flex: 0 0 56vh; height: 56vh; }
+	#status { top: auto; bottom: 12px; }
+	#error { bottom: 44px; }
+}
+@media (prefers-reduced-motion: reduce) { details > summary::before { transition: none; } }
+</style>
+
+<script type="importmap">
+{
+	"imports": {
+		"three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+		"three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+		"three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
+		"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/",
+		"nanite/": "../../node_modules/nanite/src/",
+		"nanite-path-tracing/": "../../src/"
+	}
+}
+</script>
+</head>
+
+<body>
+
+<aside id="rail">
+	<div>
+		<h1>Path Trace Debugger</h1>
+		<p class="sub">Real-time path tracing of the Nanite cluster pipeline: the same clusters, the same LOD cut and the same materials as the rasterizer, traced in a compute kernel through a static cluster hierarchy that chooses the cut while a ray walks it. No hardware ray tracing, no per-frame BVH build. <span id="pathBadge" class="badge">starting</span></p>
+	</div>
+
+	<details open>
+		<summary>Scene</summary>
+		<div class="body">
+			<div class="row"><label for="layout">Layout</label>
+				<select id="layout"><option value="showcase" selected>Showcase: 28 objects on a floor</option><option value="field">Field: 150 objects</option><option value="ring">Ring of 12</option><option value="single">One torus knot</option></select></div>
+			<div class="slider"><label for="threshold">LOD error threshold <span class="val" id="thresholdVal">1.0 px</span></label><input id="threshold" type="range" min="-2" max="5" step="0.5" value="0"></div>
+			<dl class="stats" id="buildStats"></dl>
+			<p class="hint">Every mesh's clusters and LOD DAG live in one merged set; the tracer adds a triangle BVH per cluster and one hierarchy per mesh over every level, built once. Instances get a small TLAS on the CPU each frame.</p>
+		</div>
+	</details>
+
+	<details open>
+		<summary>Path tracing</summary>
+		<div class="body">
+			<div class="slider"><label for="bounces">Bounces <span class="val" id="bouncesVal">3</span></label><input id="bounces" type="range" min="0" max="6" step="1" value="3"></div>
+			<div class="slider"><label for="spp">Samples per frame <span class="val" id="sppVal">1</span></label><input id="spp" type="range" min="1" max="4" step="1" value="1"></div>
+			<div class="slider"><label for="scale">Resolution scale <span class="val" id="scaleVal">1.00</span></label><input id="scale" type="range" min="0.25" max="1" step="0.05" value="1"></div>
+			<div class="slider"><label for="split">Raster | path traced split <span class="val" id="splitVal">0 %</span></label><input id="split" type="range" min="0" max="100" step="1" value="0"></div>
+			<div class="slider"><label for="sunSize">Sun angular radius <span class="val" id="sunSizeVal">0.5°</span></label><input id="sunSize" type="range" min="0" max="10" step="0.25" value="0.5"></div>
+			<div class="slider"><label for="exposure">Exposure <span class="val" id="exposureVal">1.00</span></label><input id="exposure" type="range" min="0.1" max="4" step="0.05" value="1"></div>
+			<label class="check"><input id="cullBack" type="checkbox"> Cull back faces (the raster draws front faces only)</label>
+			<div class="btnrow"><button id="reset">Restart accumulation</button><button id="verify">Verify primary hits against the CPU</button></div>
+			<p class="hint">Each frame adds one path per pixel: a camera ray, the sun through a shadow ray at every hit, the sky through the sampled bounce. Moving the camera restarts the sum. The left part of the split shows the raster pipeline's own frame.</p>
+		</div>
+	</details>
+
+	<details open>
+		<summary>View</summary>
+		<div class="body">
+			<div class="row"><label for="viewMode">Show</label>
+				<select id="viewMode">
+					<option value="path" selected>Path traced</option>
+					<option value="albedo">Albedo (materials, unlit)</option>
+					<option value="normal">Normals</option>
+					<option value="cluster">Cluster colors</option>
+					<option value="level">LOD level</option>
+					<option value="instance">Instance colors</option>
+					<option value="triangle">Triangle colors</option>
+					<option value="cost">Traversal cost (nodes + triangles per primary ray)</option>
+				</select></div>
+			<div class="slider"><label for="sun">Sun azimuth <span class="val" id="sunVal">40°</span></label><input id="sun" type="range" min="0" max="360" step="1" value="40"></div>
+			<div class="slider"><label for="sunElevation">Sun elevation <span class="val" id="sunElevationVal">39°</span></label><input id="sunElevation" type="range" min="5" max="85" step="1" value="39"></div>
+			<div class="slider"><label for="roughness">Roughness <span class="val" id="roughnessVal">0.5</span></label><input id="roughness" type="range" min="0.05" max="1" step="0.05" value="0.5"></div>
+			<div class="slider"><label for="metalness">Metalness <span class="val" id="metalnessVal">0.0</span></label><input id="metalness" type="range" min="0" max="1" step="0.05" value="0"></div>
+		</div>
+	</details>
+
+	<details open>
+		<summary>GPU results (read back)</summary>
+		<div class="body">
+			<dl class="stats" id="gpuStats"></dl>
+		</div>
+	</details>
+
+	<details>
+		<summary>What runs each frame</summary>
+		<div class="body">
+			<p class="hint">Raster (left of the split): the cull kernel over every (instance, cluster) pair (frustum, cone, LOD cut) and one indirect draw. Path tracing: a CPU TLAS over the instances, then per bounce a trace kernel (one thread per pixel: TLAS → the mesh's cluster hierarchy, skipping subtrees whose largest parent error projects below the threshold or whose smallest own error projects above it, applying the cull kernel's cut rule at each cluster, then the cluster's triangle BVH through the mesh's own corner fetch) and a shade kernel (material table, GGX + Lambert, a shadow ray towards the sun disk, a sampled next direction, Russian roulette). The display quad divides the sums by the sample count; the debug views are drawn from the primary hit record.</p>
+		</div>
+	</details>
+</aside>
+
+<main id="view">
+	<div id="overlay">
+		<div class="tag" id="fps">—</div>
+		<div class="tag" id="samplesTag">—</div>
+	</div>
+	<div id="status">initializing</div>
+	<div id="error" hidden></div>
+</main>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

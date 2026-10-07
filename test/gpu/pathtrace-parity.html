@@ -1,0 +1,124 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Path trace parity test</title>
+<script type="importmap">
+{ "imports": {
+	"three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+	"three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+	"three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
+	"nanite/": "../../node_modules/nanite/src/",
+	"nanite-path-tracing/": "../../src/"
+} }
+</script></head><body><pre id="out">running</pre>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import { buildLodMeshletSetFromGeometry, MeshletMesh, MeshletScene, MaterialTable } from 'nanite/meshlets/index.js';
+import { PathTracePass, PathTraceView, traceRay, cameraRay } from 'nanite-path-tracing/index.js';
+
+const out = document.getElementById( 'out' );
+const params = new URLSearchParams( location.search );
+const W = parseInt( params.get( 'w' ) || '96', 10 ), H = parseInt( params.get( 'h' ) || '72', 10 );
+const publish = ( r ) => { window.__gpuTest = { done: true, ...r }; out.textContent = JSON.stringify( r, null, 2 ); };
+const t0 = performance.now();
+try {
+
+	const renderer = new THREE.WebGPURenderer( { antialias: false } );
+	await renderer.init();
+	if ( ! renderer.backend.isWebGPUBackend ) throw new Error( 'no WebGPU backend' );
+	renderer.setSize( W, H, false );
+	// headless SwiftShader cannot create a canvas swap chain (the device is lost on present): the display is drawn into a render target
+	const target = new THREE.RenderTarget( W, H );
+
+	// --- a scene of two meshes, several instances, a material table ---------------------------------------------------
+	const knot = buildLodMeshletSetFromGeometry( new THREE.TorusKnotGeometry( 1, 0.34, 128, 24 ), { attributes: true, maxTriangles: 64, maxVertices: 64 } );
+	const sphere = buildLodMeshletSetFromGeometry( new THREE.SphereGeometry( 1.2, 64, 48 ), { attributes: true, maxTriangles: 64, maxVertices: 64 } );
+	const scene = new MeshletScene( [ knot, sphere ], { maxInstances: 16 } );
+	const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s = new THREE.Vector3();
+	const add = ( k, x, y, z, yaw, sx, sy = sx, sz = sx ) => scene.addInstance( k, m.compose( p.set( x, y, z ), q.setFromEuler( new THREE.Euler( 0, yaw, 0 ) ), s.set( sx, sy, sz ) ) );
+	add( 0, 0, 0, 0, 0, 1 ); add( 1, 3, 0.5, - 1, 0.7, 1.3 ); add( 0, - 3, 1, 2, 2.1, 0.8, 1.5, 0.6 ); add( 1, 1, - 2, 4, 0.3, 0.7 );
+	const materials = new MaterialTable( { size: 64, maxMaterials: 4, maxInstances: 16 } );
+	// this Chromium build rejects three r185's mipmap view descriptor for array textures: no mipmaps in the test
+	materials.texture.generateMipmaps = false; materials.texture.minFilter = THREE.LinearFilter;
+	materials.setMaterial( 0, { color: [ 0.9, 0.6, 0.3 ], roughness: 0.6 } ); materials.setMaterial( 1, { color: [ 0.3, 0.6, 0.9 ], roughness: 0.2, metalness: 0.9 } );
+	materials.setInstanceMaterial( 0, 0 ); materials.setInstanceMaterial( 1, 1 ); materials.setInstanceMaterial( 2, 0 ); materials.setInstanceMaterial( 3, 1 );
+	const mesh = new MeshletMesh( scene.set, { scene, materials } );
+	const camera = new THREE.PerspectiveCamera( 50, W / H, 0.1, 100 );
+	camera.position.set( 4, 3, 8 ); camera.lookAt( 0, 0, 0 ); camera.updateMatrixWorld();
+
+	const workgroupSize = parseInt( params.get( 'wg' ) || '64', 10 );
+	const pass = new PathTracePass( mesh, W, H, { maxBounces: 0, workgroupSize, storageBufferLimit: renderer.backend.device.limits.maxStorageBuffersPerShaderStage } );
+	pass.jitter = false;
+	pass.setViewport( camera, H );
+	pass.lodThreshold = parseFloat( params.get( 'threshold' ) || '1' );
+	const tBuild = performance.now() - t0;
+
+	// --- primary hits: GPU vs CPU, every pixel ------------------------------------------------------------------------
+	pass.execute( renderer, camera );
+	const data = new Float32Array( await renderer.getArrayBufferAsync( pass.buffers.frame ) );
+	const ctx = pass.getTraceContext(), lod = pass.getLodParams();
+	const cw = camera.matrixWorld.elements, fov = camera.fov * Math.PI / 180;
+	let hitsGpu = 0, hitsCpu = 0, mismatches = 0, costSum = 0;
+	const examples = [];
+	for ( let py = 0; py < H; py ++ ) for ( let px = 0; px < W; px ++ ) {
+
+		const i = ( W * H + py * W + px ) * 4;
+		const gInst = data[ i ] - 1, gCluster = data[ i + 1 ], gTri = data[ i + 2 ];
+		costSum += data[ i + 3 ];
+		const { origin, direction } = cameraRay( cw, fov, W, H, px, py );
+		const c = traceRay( ctx, origin, direction, lod );
+		if ( gInst >= 0 ) hitsGpu ++; if ( c ) hitsCpu ++;
+		const same = c ? ( gInst === c.instance && gCluster === c.cluster && gTri === c.triangle ) : gInst < 0;
+		if ( ! same ) { mismatches ++; if ( examples.length < 5 ) examples.push( { px, py, gpu: [ gInst, gCluster, gTri ], cpu: c ? [ c.instance, c.cluster, c.triangle, +c.t.toFixed( 4 ) ] : null } ); }
+
+	}
+
+	// --- a few bounced frames: finite, non-black image ---------------------------------------------------------------
+	pass.maxBounces = 2; pass.jitter = true; pass.samplesPerFrame = 1;
+	const tFrame = performance.now();
+	for ( let f = 0; f < 3; f ++ ) pass.execute( renderer, camera );
+	renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
+	const shown = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
+	let shownSum = 0; for ( let k = 0; k < shown.length; k += 4 ) shownSum += shown[ k ] + shown[ k + 1 ] + shown[ k + 2 ];
+	const frames = new Float32Array( await renderer.getArrayBufferAsync( pass.buffers.frame ) );
+	const msFrame = ( performance.now() - tFrame ) / 3;
+	let sumR = 0, sumG = 0, sumB = 0, finite = true, samples = 0;
+	for ( let k = 0; k < W * H; k ++ ) {
+
+		const r = frames[ k * 4 ], g = frames[ k * 4 + 1 ], b = frames[ k * 4 + 2 ], n = frames[ k * 4 + 3 ];
+		if ( ! Number.isFinite( r + g + b ) ) finite = false;
+		sumR += r / Math.max( 1, n ); sumG += g / Math.max( 1, n ); sumB += b / Math.max( 1, n ); samples = n;
+
+	}
+
+	const mean = [ sumR, sumG, sumB ].map( ( v ) => +( v / ( W * H ) ).toFixed( 4 ) );
+	// ?png=1: a longer render written out as a PNG (the harness saves window.__gpuTest.png)
+	let png = null;
+	if ( params.get( 'png' ) ) {
+
+		const spp = parseInt( params.get( 'spp' ) || '16', 10 );
+		pass.view = PathTraceView.PATH; pass.maxBounces = parseInt( params.get( 'bounces' ) || '3', 10 ); pass.reset();
+		for ( let f = 0; f < spp; f ++ ) pass.execute( renderer, camera );
+		renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
+		const px = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
+		const c = document.createElement( 'canvas' ); c.width = W; c.height = H;
+		const g = c.getContext( '2d' ), img = g.createImageData( W, H );
+		img.data.set( px ); g.putImageData( img, 0, 0 );
+		png = c.toDataURL( 'image/png' );
+
+	}
+
+	// debug views compile and run
+	const views = {};
+	for ( const v of [ 'NORMAL', 'CLUSTER', 'LEVEL', 'COST', 'ALBEDO' ] ) {
+
+		pass.view = PathTraceView[ v ]; pass.execute( renderer, camera );
+		renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
+		const px = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
+		let sum = 0, nonzero = 0; for ( let k = 0; k < px.length; k += 4 ) { const l = px[ k ] + px[ k + 1 ] + px[ k + 2 ]; sum += l; if ( l > 0 ) nonzero ++; }
+		views[ v ] = { mean: +( sum / ( 3 * W * H ) ).toFixed( 3 ), nonzero };
+
+	}
+
+	publish( { ok: mismatches <= Math.max( 2, W * H * 0.002 ) && hitsGpu > W * H * 0.1 && finite && mean[ 0 ] + mean[ 1 ] + mean[ 2 ] > 0.01, size: [ W, H ], clusters: scene.set.meshletCount, instances: scene.instanceCount, hitsGpu, hitsCpu, mismatches, examples, avgCost: +( costSum / ( W * H ) ).toFixed( 1 ), buildMs: +tBuild.toFixed( 0 ), msPerFrameSwiftShader: +msFrame.toFixed( 0 ), samples, mean, shownMean: +( shownSum / ( 3 * W * H ) ).toFixed( 3 ), finite, views, hierarchyDepth: pass.accel.maxHierarchyDepth, png } );
+
+} catch ( e ) { if ( ! window.__gpuTest ) publish( { ok: false, error: String( e.stack || e ) } ); }
+</script></body></html>
