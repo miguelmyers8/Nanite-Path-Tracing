@@ -8,7 +8,7 @@ import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 
 import { buildLodMeshletSetFromGeometry, MeshletMesh, MeshletScene, MeshletCullPass, MeshletColorMode, MaterialTable, LightingModel } from 'nanite/meshlets/index.js';
-import { PathTracePass, PathTraceView, traceRay, cameraRay } from 'nanite-path-tracing/index.js';
+import { PathTracePass, PathTraceView, maxFramePixels, traceRay, cameraRay } from 'nanite-path-tracing/index.js';
 
 const $ = ( id ) => document.getElementById( id );
 const ui = {};
@@ -104,7 +104,7 @@ function makePattern( name, size = 256 ) {
 const hexToRgb = ( hex ) => [ 1, 3, 5 ].map( ( i ) => parseInt( hex.slice( i, i + 2 ), 16 ) / 255 );
 const MAX_INSTANCES = 256;
 
-const state = { sets: null, scene: null, mesh: null, cull: null, tracer: null, materials: null, target: null, frameCount: 0, verify: null, verifying: false, readback: null, lastReadback: 0, lastMs: 0, timeSum: 0, timeFrames: 0 };
+const state = { sets: null, scene: null, mesh: null, cull: null, tracer: null, materials: null, target: null, frameCount: 0, verifyResult: null, verifying: false, lastMs: 0 };
 
 function normalizeGeometry( g ) {
 
@@ -157,7 +157,7 @@ function layoutInstances() {
 
 	}
 
-	state.verify = null; state.readback = null;
+	state.verifyResult = null;
 	if ( state.tracer ) state.tracer.reset();
 	syncSceneStats();
 
@@ -229,11 +229,19 @@ function disposeAll() {
 
 }
 
+const _size = new THREE.Vector2();
+
+/**
+ * Sizes in the layout's (CSS) pixels: the LOD metric of the raster and the tracer is measured in them, so both choose the same
+ * cut at any device pixel ratio; the traced frame is that size times the resolution scale (the pass clamps it to the device's
+ * buffer limits) and is stretched over the drawing buffer by the display quad.
+ */
 function frameSize() {
 
-	const size = renderer.getDrawingBufferSize( new THREE.Vector2() );
-	const s = parseFloat( ui.scale.value );
-	return { w: Math.max( 1, size.x ), h: Math.max( 1, size.y ), fw: Math.max( 1, Math.round( size.x * s ) ), fh: Math.max( 1, Math.round( size.y * s ) ) };
+	renderer.getDrawingBufferSize( _size );
+	const dpr = renderer.getPixelRatio(), s = parseFloat( ui.scale.value );
+	const cssW = _size.x / dpr, cssH = _size.y / dpr;
+	return { w: Math.max( 1, _size.x ), h: Math.max( 1, _size.y ), cssH, fw: Math.max( 1, Math.round( cssW * s ) ), fh: Math.max( 1, Math.round( cssH * s ) ) };
 
 }
 
@@ -241,12 +249,23 @@ function createTracer() {
 
 	if ( ! state.mesh ) return;
 	const { w, h, fw, fh } = frameSize();
-	const storageBufferLimit = renderer.backend?.device?.limits?.maxStorageBuffersPerShaderStage ?? 8;
-	if ( ! state.tracer ) state.tracer = new PathTracePass( state.mesh, fw, fh, { materials: state.materials, maxBounces: parseInt( ui.bounces.value, 10 ), storageBufferLimit } );
+	const limits = renderer.backend?.device?.limits;
+	const storageBufferLimit = limits?.maxStorageBuffersPerShaderStage ?? 8;
+	const maxPixels = maxFramePixels( renderer.backend?.device );
+	if ( ! state.tracer ) state.tracer = new PathTracePass( state.mesh, fw, fh, { materials: state.materials, maxBounces: parseInt( ui.bounces.value, 10 ), storageBufferLimit, maxPixels } );
 	else state.tracer.setSize( fw, fh );
 	state.tracer.setDisplaySize( w, h );
 	if ( TEST ) { if ( state.target ) state.target.dispose(); state.target = new THREE.RenderTarget( w, h ); }
 	syncSceneStats();
+
+}
+
+/** A resize or a scale change recompiles the kernels (their size is compiled in): wait until the changes stop. */
+let tracerTimer = 0;
+function scheduleTracerResize( delay = 250 ) {
+
+	clearTimeout( tracerTimer );
+	tracerTimer = setTimeout( () => { if ( state.tracer ) { createTracer(); applySettings(); } }, delay );
 
 }
 
@@ -292,14 +311,19 @@ async function verify() {
 	const t = state.tracer;
 	if ( ! t || state.verifying ) return;
 	state.verifying = true;
-	t.jitter = false; t.reset();
-	await new Promise( ( r ) => requestAnimationFrame( () => requestAnimationFrame( r ) ) ); // a frame traced through the pixel centres
+	controls.enabled = false;                       // the comparison needs the camera still
+	t.jitter = false; t.reset();                    // rays through the pixel centres, as the CPU reference traces them
 	try {
 
+		// two whole frames: the one running now may have started with the jitter on
+		const f0 = state.frameCount;
+		while ( state.frameCount < f0 + 2 ) await new Promise( ( r ) => requestAnimationFrame( r ) );
+		// what the GPU just traced with, copied now: the read below is queued behind exactly those frames (the TLAS buffer is rewritten every frame)
 		const W = t.width, H = t.height, WH = W * H;
+		const cw = t.uniforms.cameraWorld.value.elements.slice(), lod = t.getLodParams(), live = t.getTraceContext();
+		const ctx = { set: live.set, accel: live.accel, tlas: { ...live.tlas, data: live.tlas.data.slice() } };
+		const fov = camera.fov * Math.PI / 180;
 		const data = new Float32Array( await renderer.getArrayBufferAsync( t.buffers.frame, null, WH * 16, WH * 16 ) );
-		const ctx = t.getTraceContext(), lod = t.getLodParams();
-		const cw = t.uniforms.cameraWorld.value.elements, fov = camera.fov * Math.PI / 180;
 		const nx = Math.min( 64, W ), ny = Math.min( 48, H );
 		let compared = 0, mismatches = 0, hits = 0, costSum = 0;
 		for ( let p = 0; p < WH; p ++ ) costSum += data[ p * 4 + 3 ];
@@ -314,11 +338,11 @@ async function verify() {
 
 		}
 
-		state.verify = { compared, mismatches, hits, avgCost: costSum / WH, threshold: lod.threshold };
+		state.verifyResult = { compared, mismatches, hits, avgCost: costSum / WH, threshold: lod.threshold };
 
 	} catch ( err ) { console.warn( 'verify failed', err ); } finally {
 
-		t.jitter = true; t.reset(); state.verifying = false;
+		t.jitter = true; t.reset(); controls.enabled = true; state.verifying = false;
 
 	}
 
@@ -326,7 +350,7 @@ async function verify() {
 
 function syncGpuStats() {
 
-	const t = state.tracer, v = state.verify;
+	const t = state.tracer, v = state.verifyResult;
 	if ( ! t ) return;
 	ui.gpuStats.innerHTML = `
 		<dt>Samples per pixel</dt><dd>${ fmt( t.sampleCount ) }</dd>
@@ -342,7 +366,8 @@ ui.layout.addEventListener( 'change', () => { if ( state.scene ) { layoutInstanc
 for ( const el of [ ui.viewMode, ui.cullBack ] ) el.addEventListener( 'change', applySettings );
 for ( const el of [ ui.threshold, ui.bounces, ui.spp, ui.sunSize, ui.exposure, ui.sun, ui.sunElevation, ui.roughness, ui.metalness ] ) el.addEventListener( 'input', applySettings );
 ui.split.addEventListener( 'input', () => { ui.splitVal.textContent = `${ ui.split.value } %`; } );
-ui.scale.addEventListener( 'input', () => { ui.scaleVal.textContent = parseFloat( ui.scale.value ).toFixed( 2 ); createTracer(); applySettings(); } );
+ui.scale.addEventListener( 'input', () => { ui.scaleVal.textContent = parseFloat( ui.scale.value ).toFixed( 2 ); } );
+ui.scale.addEventListener( 'change', () => scheduleTracerResize( 0 ) );
 ui.reset.addEventListener( 'click', () => state.tracer && state.tracer.reset() );
 ui.verify.addEventListener( 'click', verify );
 
@@ -353,7 +378,7 @@ function resize() {
 	if ( ! w || ! h ) return;
 	renderer.setSize( w, h, false );
 	camera.aspect = w / h; camera.updateProjectionMatrix();
-	if ( state.tracer ) { createTracer(); applySettings(); }
+	if ( state.tracer ) { const d = renderer.getDrawingBufferSize( _size ); state.tracer.setDisplaySize( d.x, d.y ); state.tracer.reset(); scheduleTracerResize(); }
 
 }
 
@@ -362,13 +387,16 @@ new ResizeObserver( resize ).observe( ui.view );
 // --- frame --------------------------------------------------------------------------------------------------------
 
 let frames = 0, fpsTime = performance.now();
+/** ?test: a canvas paces the loop through its swap chain; rendering into a target has none, so a software GPU's queue grows without bound and every readback waits for all of it. One frame in flight instead. */
+let gpuBusy = false;
 
 function animate( t ) {
 
 	controls.update(); camera.updateMatrixWorld();
 	if ( ! state.tracer ) { if ( ! TEST ) renderer.render( scene, camera ); return; }
+	if ( TEST && gpuBusy ) return;
 	const t0 = performance.now();
-	const { w, h } = frameSize();
+	const { w, cssH } = frameSize();
 	const tracer = state.tracer, cull = state.cull;
 	const split = parseFloat( ui.split.value ) / 100 * w;
 	tracer.split = split;
@@ -376,15 +404,18 @@ function animate( t ) {
 	if ( TEST ) renderer.setRenderTarget( state.target );
 	if ( split > 0 || TEST ) {
 
-		cull.setViewport( camera, h / renderer.getPixelRatio() ); cull.execute( renderer, camera );
+		cull.setViewport( camera, cssH ); cull.execute( renderer, camera );
 		renderer.render( scene, camera );
 
-	} else renderer.clear();
+	}
 
-	tracer.setViewport( camera, h );
+	tracer.setViewport( camera, cssH );     // the same pixel scale as the cull above: both choose the same cut
 	tracer.execute( renderer, camera );
+	// the display quad draws over what the raster left of the split: it must not clear first (it covers every pixel when there is no split)
+	renderer.autoClear = ! ( split > 0 || TEST );
 	tracer.render( renderer );
-	if ( TEST ) renderer.setRenderTarget( null );
+	renderer.autoClear = true;
+	if ( TEST ) { renderer.setRenderTarget( null ); gpuBusy = true; renderer.backend.device.queue.onSubmittedWorkDone().then( () => { gpuBusy = false; } ); }
 	state.lastMs = performance.now() - t0;
 	frames ++; state.frameCount ++;
 	if ( t - fpsTime > 500 ) {
@@ -398,31 +429,63 @@ function animate( t ) {
 
 }
 
+/** ?test: is the raster still on the left of the split and the traced image on the right? (the display quad once cleared the raster) */
+async function checkSplit() {
+
+	const w = state.target.width, h = state.target.height;
+	const px = await renderer.readRenderTargetPixelsAsync( state.target, 0, 0, w, h );
+	const splitX = Math.round( parseFloat( ui.split.value ) / 100 * w );
+	if ( splitX <= 4 || splitX >= w - 4 ) return null;
+	// the most common colour of the left half is its background or its floor; a wiped half is one flat colour
+	const counts = new Map();
+	for ( let y = 0; y < h; y ++ ) for ( let x = 0; x < splitX; x ++ ) { const i = ( y * w + x ) * 4, key = ( px[ i ] >> 2 ) << 16 | ( px[ i + 1 ] >> 2 ) << 8 | ( px[ i + 2 ] >> 2 ); counts.set( key, ( counts.get( key ) || 0 ) + 1 ); }
+	let mode = 0, best = 0; for ( const [ k, c ] of counts ) if ( c > best ) { best = c; mode = k; }
+	const left = best / ( splitX * h );
+	let rightMode = 0; for ( let y = 0; y < h; y ++ ) for ( let x = splitX; x < w; x ++ ) { const i = ( y * w + x ) * 4; if ( ( ( px[ i ] >> 2 ) << 16 | ( px[ i + 1 ] >> 2 ) << 8 | ( px[ i + 2 ] >> 2 ) ) === mode ) rightMode ++; }
+	return { splitX, leftSameAsMode: +left.toFixed( 3 ), rightSharesLeftMode: +( rightMode / ( ( w - splitX ) * h ) ).toFixed( 3 ), ok: left < 0.97 };
+
+}
+
 async function boot() {
 
 	try {
 
 		const adapter = await navigator.gpu.requestAdapter();
-		if ( adapter && renderer.backend?.parameters ) renderer.backend.parameters.requiredLimits = { maxStorageBuffersPerShaderStage: Math.min( 16, adapter.limits.maxStorageBuffersPerShaderStage ) };
+		// the cull kernel binds more storage buffers than WebGPU's guaranteed eight, and the traced frame (nine vec4 per pixel) a large one:
+		// ask the adapter for what it has, within sensible caps
+		if ( adapter && renderer.backend?.parameters ) renderer.backend.parameters.requiredLimits = {
+			maxStorageBuffersPerShaderStage: Math.min( 16, adapter.limits.maxStorageBuffersPerShaderStage ),
+			maxStorageBufferBindingSize: Math.min( 1073741824, adapter.limits.maxStorageBufferBindingSize ),
+			maxBufferSize: Math.min( 1073741824, adapter.limits.maxBufferSize ),
+		};
 
 	} catch ( err ) { /* defaults */ }
 	try { await renderer.init(); } catch ( err ) { showError( `WebGPU init failed: ${ err.message }. This page has no WebGL fallback.` ); return; }
 	if ( ! renderer.backend?.isWebGPUBackend ) { showError( 'WebGPU is not available; this page has no WebGL fallback.' ); return; }
-	if ( TEST ) { ui.bounces.value = params.get( 'bounces' ) || '1'; ui.layout.value = params.get( 'layout' ) || 'ring'; ui.split.value = params.get( 'split' ) || '50'; }
+	if ( TEST ) { ui.bounces.value = params.get( 'bounces' ) || '1'; ui.layout.value = params.get( 'layout' ) || 'ring'; ui.split.value = params.get( 'split' ) || '50'; ui.scale.value = params.get( 'scale' ) || '1'; }
 	resize();
 	renderer.setAnimationLoop( animate );
 	await rebuild();
 	if ( TEST ) {
 
-		// a few frames, then the CPU comparison, then the verdict
+		// a few frames, then the CPU comparison, the split check, then the verdict
+		const tA = performance.now(), framesA = state.frameCount;
 		await new Promise( ( r ) => setTimeout( r, 1500 ) );
+		const tB = performance.now(), framesB = state.frameCount;
 		await verify();
-		const v = state.verify;
-		window.__gpuTest = { done: true, ok: !! v && v.mismatches <= Math.max( 2, v.compared * 0.002 ), verify: v, frames: state.frameCount, samples: state.tracer.sampleCount, clusters: state.scene.set.meshletCount, instances: state.scene.instanceCount, lastMs: state.lastMs };
+		const tC = performance.now();
+		const v = state.verifyResult, split = await checkSplit();
+		const tD = performance.now();
+		const timings = { sleepMs: Math.round( tB - tA ), framesDuringSleep: framesB - framesA, verifyMs: Math.round( tC - tB ), splitMs: Math.round( tD - tC ), framesTotal: state.frameCount };
+		window.__gpuTest = {
+			done: true, ok: !! v && v.mismatches <= Math.max( 2, v.compared * 0.002 ) && ( split === null || split.ok ),
+			verify: v, split, timings, frames: state.frameCount, samples: state.tracer.sampleCount, frame: [ state.tracer.width, state.tracer.height ],
+			clusters: state.scene.set.meshletCount, instances: state.scene.instanceCount, lastMs: state.lastMs,
+		};
 
 	}
 
 }
 
-window.pathTraceDebugger = state; state.camera = camera; state.controls = controls; state.getRenderer = () => renderer; state.rebuild = rebuild; state.verify = verify;
+window.pathTraceDebugger = state; state.camera = camera; state.controls = controls; state.getRenderer = () => renderer; state.rebuild = rebuild; state.runVerify = verify;
 boot();

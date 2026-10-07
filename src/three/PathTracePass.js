@@ -24,6 +24,9 @@
  * keep more rays in flight, and the split is where ray compaction or sorting
  * would go).
  *
+ * The frame buffer is nine vec4 per pixel (`FRAME_BYTES_PER_PIXEL`), so a large frame needs the adapter's storage binding
+ * limit in the device's `requiredLimits`; `maxPixels` makes the pass scale a larger request down instead of failing.
+ *
  * Storage buffers (WebGPU's guaranteed eight): accel (hierarchies, cluster
  * BVHs, order, cluster table), tlas (instance nodes and records), frame
  * (colour sum per pixel; the primary hit's ids, cost and barycentrics for
@@ -51,6 +54,22 @@ import {
 } from '../core/accel.js';
 import { RAY_EPSILON, STACK_TLAS, STACK_HIERARCHY, STACK_CLUSTER } from '../core/trace.js';
 
+/** Bytes per pixel of the frame buffer: nine vec4 (colour sum, primary hit record, barycentrics, six path-state slots). */
+export const FRAME_BYTES_PER_PIXEL = 9 * 16;
+
+/**
+ * The most pixels one frame buffer can hold on a device: its storage binding and buffer size limits (WebGPU's defaults are
+ * 128 MiB and 256 MiB, which is about 930 000 pixels; ask the adapter for more in the device's `requiredLimits`).
+ * @param {GPUDevice} [device]  `renderer.backend.device`
+ */
+export function maxFramePixels( device ) {
+
+	const l = device && device.limits;
+	const bytes = Math.min( l ? l.maxStorageBufferBindingSize : 134217728, l ? l.maxBufferSize : 268435456 );
+	return Math.max( 1, Math.floor( bytes / FRAME_BYTES_PER_PIXEL ) );
+
+}
+
 export const PathTraceView = Object.freeze( { PATH: 0, NORMAL: 1, CLUSTER: 2, LEVEL: 3, INSTANCE: 4, COST: 5, ALBEDO: 6, TRIANGLE: 7 } );
 
 const WORKGROUP_SIZE = 64;
@@ -72,6 +91,7 @@ export class PathTracePass {
 	 * @param {Object} [options.accel]      buildAccel options
 	 * @param {number} [options.storageBufferLimit=8]
 	 * @param {number} [options.workgroupSize=64]  invocations per workgroup of the trace kernel
+	 * @param {number} [options.maxPixels]         the frame's pixel cap (maxFramePixels( renderer.backend.device )); default: none
 	 */
 	constructor( mesh, width, height, options = {} ) {
 
@@ -129,6 +149,8 @@ export class PathTracePass {
 			background: uniform( new Vector3( 0.043, 0.055, 0.07 ) ),
 		};
 
+		/** the frame never holds more pixels than this (maxFramePixels( device )): a larger request is scaled down, keeping its shape */
+		this.maxPixels = Math.max( 1, options.maxPixels ?? Infinity );
 		this._width = 0; this._height = 0; this.frameCount = 0; this.sampleCount = 0;
 		this._needsReset = true;
 		this.material = new MeshBasicNodeMaterial();
@@ -190,6 +212,14 @@ export class PathTracePass {
 	setSize( width, height ) {
 
 		width = Math.max( 1, width | 0 ); height = Math.max( 1, height | 0 );
+		if ( width * height > this.maxPixels ) {
+
+			const k = Math.sqrt( this.maxPixels / ( width * height ) );
+			width = Math.max( 1, Math.floor( width * k ) ); height = Math.max( 1, Math.floor( height * k ) );
+			while ( width * height > this.maxPixels && width > 1 ) width --;
+
+		}
+
 		if ( width === this._width && height === this._height ) return false;
 		this._width = width; this._height = height;
 		this.uniforms.width.value = width; this.uniforms.height.value = height;

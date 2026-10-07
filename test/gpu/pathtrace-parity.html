@@ -12,7 +12,7 @@
 <script type="module">
 import * as THREE from 'three/webgpu';
 import { buildLodMeshletSetFromGeometry, MeshletMesh, MeshletScene, MaterialTable } from 'nanite/meshlets/index.js';
-import { PathTracePass, PathTraceView, traceRay, cameraRay } from 'nanite-path-tracing/index.js';
+import { PathTracePass, PathTraceView, maxFramePixels, traceRay, cameraRay } from 'nanite-path-tracing/index.js';
 
 const out = document.getElementById( 'out' );
 const params = new URLSearchParams( location.search );
@@ -71,25 +71,42 @@ try {
 
 	}
 
-	// --- a few bounced frames: finite, non-black image ---------------------------------------------------------------
-	pass.maxBounces = 2; pass.jitter = true; pass.samplesPerFrame = 1;
-	const tFrame = performance.now();
-	for ( let f = 0; f < 3; f ++ ) pass.execute( renderer, camera );
+	// --- bounces add light: the same scene at 0 and at 2 bounces (stale per-dispatch uniforms would make them equal) -------
+	const meanOf = async ( bounces, frames ) => {
+
+		pass.maxBounces = bounces; pass.jitter = true; pass.samplesPerFrame = 1; pass.view = PathTraceView.PATH; pass.reset();
+		const t = performance.now();
+		for ( let f = 0; f < frames; f ++ ) pass.execute( renderer, camera );
+		const data = new Float32Array( await renderer.getArrayBufferAsync( pass.buffers.frame, null, 0, W * H * 16 ) );
+		let r = 0, g = 0, b = 0, finite = true, n = 0;
+		for ( let k = 0; k < W * H; k ++ ) {
+
+			const c = data[ k * 4 + 3 ] || 1, pr = data[ k * 4 ] / c, pg = data[ k * 4 + 1 ] / c, pb = data[ k * 4 + 2 ] / c;
+			if ( ! Number.isFinite( pr + pg + pb ) ) finite = false;
+			r += pr; g += pg; b += pb; n = data[ k * 4 + 3 ];
+
+		}
+
+		return { mean: [ r, g, b ].map( ( v ) => +( v / ( W * H ) ).toFixed( 4 ) ), finite, samples: n, ms: ( performance.now() - t ) / frames };
+
+	};
+
+	const m0 = await meanOf( 0, 6 ), m2 = await meanOf( 2, 6 );
+	const lum = ( m ) => m.mean[ 0 ] + m.mean[ 1 ] + m.mean[ 2 ];
+	const finite = m0.finite && m2.finite;
+	const mean = m2.mean, samples = m2.samples, msFrame = m2.ms;
+	const bouncesAddLight = lum( m2 ) > lum( m0 ) * 1.02;
+	// display: the accumulated image draws into the target and is not black
 	renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
 	const shown = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
 	let shownSum = 0; for ( let k = 0; k < shown.length; k += 4 ) shownSum += shown[ k ] + shown[ k + 1 ] + shown[ k + 2 ];
-	const frames = new Float32Array( await renderer.getArrayBufferAsync( pass.buffers.frame ) );
-	const msFrame = ( performance.now() - tFrame ) / 3;
-	let sumR = 0, sumG = 0, sumB = 0, finite = true, samples = 0;
-	for ( let k = 0; k < W * H; k ++ ) {
 
-		const r = frames[ k * 4 ], g = frames[ k * 4 + 1 ], b = frames[ k * 4 + 2 ], n = frames[ k * 4 + 3 ];
-		if ( ! Number.isFinite( r + g + b ) ) finite = false;
-		sumR += r / Math.max( 1, n ); sumG += g / Math.max( 1, n ); sumB += b / Math.max( 1, n ); samples = n;
+	// --- the frame clamps to the pixel cap, keeping its shape ---------------------------------------------------------------
+	const capped = new PathTracePass( mesh, 400, 300, { maxBounces: 0, maxPixels: 1000, workgroupSize } );
+	const clamp = { width: capped.width, height: capped.height, pixels: capped.width * capped.height, aspect: +( capped.width / capped.height ).toFixed( 2 ) };
+	capped.dispose();
+	const maxPx = maxFramePixels( renderer.backend.device ), defaultsPx = maxFramePixels( { limits: { maxStorageBufferBindingSize: 134217728, maxBufferSize: 268435456 } } );
 
-	}
-
-	const mean = [ sumR, sumG, sumB ].map( ( v ) => +( v / ( W * H ) ).toFixed( 4 ) );
 	// ?png=1: a longer render written out as a PNG (the harness saves window.__gpuTest.png)
 	let png = null;
 	if ( params.get( 'png' ) ) {
@@ -118,7 +135,13 @@ try {
 
 	}
 
-	publish( { ok: mismatches <= Math.max( 2, W * H * 0.002 ) && hitsGpu > W * H * 0.1 && finite && mean[ 0 ] + mean[ 1 ] + mean[ 2 ] > 0.01, size: [ W, H ], clusters: scene.set.meshletCount, instances: scene.instanceCount, hitsGpu, hitsCpu, mismatches, examples, avgCost: +( costSum / ( W * H ) ).toFixed( 1 ), buildMs: +tBuild.toFixed( 0 ), msPerFrameSwiftShader: +msFrame.toFixed( 0 ), samples, mean, shownMean: +( shownSum / ( 3 * W * H ) ).toFixed( 3 ), finite, views, hierarchyDepth: pass.accel.maxHierarchyDepth, png } );
+	publish( {
+		ok: mismatches <= Math.max( 2, W * H * 0.002 ) && hitsGpu > W * H * 0.1 && finite && lum( m2 ) > 0.01 && bouncesAddLight && shownSum > 0 && clamp.pixels <= 1000 && clamp.pixels > 800 && Math.abs( clamp.aspect - 1.33 ) < 0.1 && defaultsPx === 932067,
+		size: [ W, H ], clusters: scene.set.meshletCount, instances: scene.instanceCount, hitsGpu, hitsCpu, mismatches, examples,
+		avgCost: +( costSum / ( W * H ) ).toFixed( 1 ), buildMs: +tBuild.toFixed( 0 ), msPerFrameSwiftShader: +msFrame.toFixed( 0 ), samples,
+		meanBounce0: m0.mean, meanBounce2: m2.mean, bouncesAddLight, finite, shownMean: +( shownSum / ( 3 * W * H ) ).toFixed( 3 ),
+		clamp, maxFramePixels: maxPx, defaultLimitPixels: defaultsPx, views, hierarchyDepth: pass.accel.maxHierarchyDepth, png,
+	} );
 
 } catch ( e ) { if ( ! window.__gpuTest ) publish( { ok: false, error: String( e.stack || e ) } ); }
 </script></body></html>
