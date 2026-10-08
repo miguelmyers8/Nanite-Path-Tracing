@@ -110,7 +110,7 @@ export function traceRay( ctx, origin, direction, lod, options = {} ) {
 
 		const ro = ( tlas.instanceBase + inst * TLAS_INSTANCE_VEC4 ) * 4;
 		const M = T.subarray( ro, ro + 16 ), inv = T.subarray( ro + 16, ro + 32 );
-		const root = TU[ ro + 32 ], maxScale = T[ ro + 33 ], minScale = T[ ro + 34 ];
+		const root = TU[ ro + 32 ], maxScale = T[ ro + 33 ], pruneMax = T[ ro + 36 ], pruneMin = T[ ro + 37 ];
 
 		// the ray in object space (direction unnormalized so t is shared with world space); the camera too, for the LOD distances
 		const pox = inv[ 0 ] * ox + inv[ 4 ] * oy + inv[ 8 ] * oz + inv[ 12 ];
@@ -124,7 +124,6 @@ export function traceRay( ctx, origin, direction, lod, options = {} ) {
 		const ccy = inv[ 1 ] * cam[ 0 ] + inv[ 5 ] * cam[ 1 ] + inv[ 9 ] * cam[ 2 ] + inv[ 13 ];
 		const ccz = inv[ 2 ] * cam[ 0 ] + inv[ 6 ] * cam[ 1 ] + inv[ 10 ] * cam[ 2 ] + inv[ 14 ];
 		const errScale = maxScale * lod.pixelScale;
-		const scaleGap = ( maxScale - minScale );
 
 		const hstack = new Uint32Array( STACK_HIERARCHY );
 		let hsp = 0;
@@ -146,13 +145,14 @@ export function traceRay( ctx, origin, direction, lod, options = {} ) {
 					// too fine: the largest parent error, projected at the nearest possible distance, is at or below the threshold
 					const maxParentError = A[ o + 7 ], minOwnError = A[ o + 11 ], maxParentRadius = A[ o + 15 ];
 					const nearD = boxDistance( A[ o + 8 ], A[ o + 9 ], A[ o + 10 ], A[ o + 12 ], A[ o + 13 ], A[ o + 14 ], ccx, ccy, ccz );
-					const nearW = Math.max( minScale * nearD - maxParentRadius * maxScale - scaleGap * 0, lod.near );
-					// (a non-uniform scale: minScale shrinks the distance, maxScale grows the radius; both already on the safe side)
+					// the cut rule's own terms keep the column-norm maxScale (the radius, the error scale: exactly the cull kernel's); only the
+					// distance is bounded with the singular-value bounds, so the prune is sound for any instance matrix
+					const nearW = Math.max( pruneMin * nearD - maxParentRadius * maxScale, lod.near );
 					const parentUpper = maxParentError * errScale / nearW;
 					if ( parentUpper <= lod.threshold ) continue;
 					// too coarse: the smallest own error, projected at the farthest possible distance, is above the threshold
 					const farD = boxFarDistance( A[ o + 8 ], A[ o + 9 ], A[ o + 10 ], A[ o + 12 ], A[ o + 13 ], A[ o + 14 ], ccx, ccy, ccz );
-					const farW = Math.max( maxScale * farD, lod.near );
+					const farW = Math.max( pruneMax * farD, lod.near );
 					const ownLower = minOwnError * errScale / farW;
 					if ( ownLower > lod.threshold ) continue;
 

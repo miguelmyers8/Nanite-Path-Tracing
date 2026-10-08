@@ -3,7 +3,8 @@
 Real-time path tracing of the [Nanite-style cluster pipeline](https://github.com/miguelmyers8/Nanite)
 (three.js r185 `WebGPURenderer`, TSL compute), tracing the same clusters,
 the same LOD cut and the same materials the rasterizer draws, with no
-hardware ray tracing and no per-frame BVH build.
+hardware ray tracing and no per-frame build over the geometry or the cut (a small
+BVH over the instances is rebuilt each frame).
 
 ![320 × 240, 12 samples per pixel, 3 bounces, rendered by the test suite on SwiftShader](docs/images/pathtrace-swiftshader-320x240-12spp.png)
 
@@ -11,7 +12,8 @@ hardware ray tracing and no per-frame BVH build.
 | --- | --- | --- |
 | 1. Acceleration structures: triangle BVH per cluster, a hierarchy per mesh over every LOD level with the error bounds a ray prunes with, a per-frame instance TLAS, packed layouts, CPU reference traversal | done | `test/core.test.mjs` |
 | 2. The tracer: trace and shade compute kernels (camera rays, the cut chosen in the traversal, sun shadow rays, GGX + Lambert, hemisphere sky, progressive accumulation), display with debug views | done | `examples/pathtrace-debugger/` |
-| 3. Headless validation on SwiftShader: GPU primary hits against the CPU twin pixel for pixel | done | `npm run gpu-test` |
+| 3. Headless validation on SwiftShader: GPU primary hits against the CPU twin (0 mismatches required), the random numbers, bounces, every view, the debugger's own checks | done | `npm run gpu-test` |
+| 4. Packaging as a claude.ai Artifact: one self-contained folder, built and checked by a script | done | `npm run build:artifact` |
 
 ## The two questions this project started with
 
@@ -33,7 +35,7 @@ and the industry's answers (Unreal's fallback mesh, streamed-out BLAS and
 RTX Mega Geometry; NVIDIA's cluster acceleration structures; Intel's
 hierarchical-LOD ray tracing) are in `docs/research/02-path-tracing-nanite.md`.
 
-## How it traces a cut without building anything per frame
+## How it traces a cut without a per-frame build over the geometry
 
 Every cluster of the Nanite set carries its own and its parent group's
 bounding sphere and error, and the cull kernel draws a cluster when its own
@@ -61,17 +63,22 @@ radius. A ray:
 The cull kernel's CPU reference (`lodSelected`) is called by the tracer's
 CPU twin, and the tracer's GPU kernel evaluates the same expressions, so the
 three agree: the test suite compares the GPU's primary hits (instance,
-cluster, triangle) with the CPU's on every pixel and finds none that differ.
+cluster, triangle) with the CPU's on every pixel of a 96 × 72 frame, and the
+debugger on 3,072 sampled rays, and requires no mismatch (none is measured; a
+matrix whose columns are not orthogonal needs the singular-value bounds the
+TLAS record carries, and has its own regression test).
 
 ## Usage
 
 ```js
 import { buildLodMeshletSetFromGeometry, MeshletMesh, MeshletScene, MaterialTable } from 'nanite/meshlets/index.js';
-import { PathTracePass, PathTraceView } from 'nanite-path-tracing/index.js';
+import { PathTracePass, PathTraceView, maxFramePixels } from 'nanite-path-tracing';
 
 const scene = new MeshletScene( sets, { maxInstances: 256 } );        // or one MeshletMesh of one set
 const mesh = new MeshletMesh( scene.set, { scene, materials } );       // the raster's mesh: its buffers are read as they are
-const tracer = new PathTracePass( mesh, width, height, { materials, maxBounces: 3 } );
+// the frame is nine vec4 per pixel (144 bytes): maxPixels scales a request down to what the device's buffers hold (about 930 000
+// pixels at WebGPU's default limits; ask the adapter for more in the device's requiredLimits, as the debugger does)
+const tracer = new PathTracePass( mesh, width, height, { materials, maxBounces: 3, maxPixels: maxFramePixels( renderer.backend.device ) } );
 
 function frame() {
 	tracer.setViewport( camera, heightPixels );   // the cull kernel's pixel scale: the same cut as the raster
@@ -83,9 +90,12 @@ function frame() {
 
 `tracer.view` selects `PathTraceView.PATH` or a debug view drawn from the
 primary hit record (NORMAL, CLUSTER with the raster's cluster colours, LEVEL,
-INSTANCE, TRIANGLE, ALBEDO, COST). Moving the camera, or changing anything
-the cut or the image depends on, restarts the accumulation; `samplesPerFrame`
-and `maxBounces` trade speed for convergence. The tracer shares the mesh's
+INSTANCE, TRIANGLE, ALBEDO, COST; the debug views trace the pixel centre).
+Moving the camera, resizing, and changing the tracer's own settings (view,
+bounces, LOD threshold, sun size, back-face culling) restart the accumulation;
+**call `tracer.reset()` after changing instance matrices, the light or the
+materials**, which the tracer cannot see change. `samplesPerFrame` and
+`maxBounces` trade speed for convergence. The tracer shares the mesh's
 lighting uniforms (sun direction and colour, sky and ground colours) and
 keeps the raster's light convention: a Lambert surface facing the sun returns
 `albedo × lightColor`, and the hemisphere sky is the environment.
@@ -110,7 +120,7 @@ the way the Nanite repository pins its own SpatialPrimitives dependency:
 "dependencies": { "nanite": "git+https://github.com/miguelmyers8/Nanite.git#<commit>" }
 ```
 
-`npm install` fetches it into `node_modules/nanite`; the pages map
+`npm install` fetches it into `node_modules/nanite`; this package's own `exports` map `.` to `src/index.js`, `./core` to the dependency-free core and `./*` to `src/*`, which is what the `nanite-path-tracing/` specifier of the pages' import maps names. The pages map
 `nanite/` to `node_modules/nanite/src/` in their import map and the code
 imports `nanite/meshlets/index.js` (the three.js layer) and
 `nanite/meshlets/core.js` (dependency-free). The pinned commit adds a
@@ -126,6 +136,8 @@ npm install          # three@0.185.0 and the Nanite pipeline
 npm test             # node --test: the builders, the packed layouts, the CPU traversal against the brute force
 npm run dev          # static server on :8080, open /examples/pathtrace-debugger/
 npm run gpu-test     # headless Chrome with WebGPU through SwiftShader: the kernels against the CPU twin (needs playwright)
+npm run build:artifact   # dist/pathtrace-debugger: the debugger as a self-contained folder for a claude.ai Artifact
+npm run test:artifact    # build it, then run the built page's own checks
 ```
 
 The debugger (`examples/pathtrace-debugger/`) shows the raster pipeline's

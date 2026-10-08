@@ -18,6 +18,9 @@ const out = document.getElementById( 'out' );
 const params = new URLSearchParams( location.search );
 const W = parseInt( params.get( 'w' ) || '96', 10 ), H = parseInt( params.get( 'h' ) || '72', 10 );
 const publish = ( r ) => { window.__gpuTest = { done: true, ...r }; out.textContent = JSON.stringify( r, null, 2 ); };
+// readRenderTargetPixelsAsync pads every row to a multiple of 256 bytes
+const unpad = ( px, w, h ) => { const stride = Math.ceil( w * 4 / 256 ) * 256; if ( px.length === w * h * 4 ) return px; const o = new Uint8Array( w * h * 4 ); for ( let y = 0; y < h; y ++ ) o.set( px.subarray( y * stride, y * stride + w * 4 ), y * w * 4 ); return o; };
+const tolerance = parseFloat( params.get( 'tol' ) || '0' );   // fraction of pixels allowed to differ (0 on SwiftShader; allow a little on other hardware)
 const t0 = performance.now();
 try {
 
@@ -98,7 +101,7 @@ try {
 	const bouncesAddLight = lum( m2 ) > lum( m0 ) * 1.02;
 	// display: the accumulated image draws into the target and is not black
 	renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
-	const shown = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
+	const shown = unpad( await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H ), W, H );
 	let shownSum = 0; for ( let k = 0; k < shown.length; k += 4 ) shownSum += shown[ k ] + shown[ k + 1 ] + shown[ k + 2 ];
 
 	// --- the frame clamps to the pixel cap, keeping its shape ---------------------------------------------------------------
@@ -115,7 +118,7 @@ try {
 		pass.view = PathTraceView.PATH; pass.maxBounces = parseInt( params.get( 'bounces' ) || '3', 10 ); pass.reset();
 		for ( let f = 0; f < spp; f ++ ) pass.execute( renderer, camera );
 		renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
-		const px = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
+		const px = unpad( await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H ), W, H );
 		const c = document.createElement( 'canvas' ); c.width = W; c.height = H;
 		const g = c.getContext( '2d' ), img = g.createImageData( W, H );
 		img.data.set( px ); g.putImageData( img, 0, 0 );
@@ -125,18 +128,18 @@ try {
 
 	// debug views compile and run
 	const views = {};
-	for ( const v of [ 'NORMAL', 'CLUSTER', 'LEVEL', 'COST', 'ALBEDO' ] ) {
+	for ( const v of [ 'NORMAL', 'CLUSTER', 'LEVEL', 'INSTANCE', 'TRIANGLE', 'COST', 'ALBEDO' ] ) {
 
 		pass.view = PathTraceView[ v ]; pass.execute( renderer, camera );
 		renderer.setRenderTarget( target ); pass.render( renderer ); renderer.setRenderTarget( null );
-		const px = await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H );
+		const px = unpad( await renderer.readRenderTargetPixelsAsync( target, 0, 0, W, H ), W, H );
 		let sum = 0, nonzero = 0; for ( let k = 0; k < px.length; k += 4 ) { const l = px[ k ] + px[ k + 1 ] + px[ k + 2 ]; sum += l; if ( l > 0 ) nonzero ++; }
 		views[ v ] = { mean: +( sum / ( 3 * W * H ) ).toFixed( 3 ), nonzero };
 
 	}
 
 	publish( {
-		ok: mismatches <= Math.max( 2, W * H * 0.002 ) && hitsGpu > W * H * 0.1 && finite && lum( m2 ) > 0.01 && bouncesAddLight && shownSum > 0 && clamp.pixels <= 1000 && clamp.pixels > 800 && Math.abs( clamp.aspect - 1.33 ) < 0.1 && defaultsPx === 932067,
+		ok: mismatches <= W * H * tolerance && Object.values( views ).every( ( v ) => v.nonzero > W * H * 0.9 ) && hitsGpu > W * H * 0.1 && finite && lum( m2 ) > 0.01 && bouncesAddLight && shownSum > 0 && clamp.pixels <= 1000 && clamp.pixels > 800 && Math.abs( clamp.aspect - 1.33 ) < 0.1 && defaultsPx === 932067,
 		size: [ W, H ], clusters: scene.set.meshletCount, instances: scene.instanceCount, hitsGpu, hitsCpu, mismatches, examples,
 		avgCost: +( costSum / ( W * H ) ).toFixed( 1 ), buildMs: +tBuild.toFixed( 0 ), msPerFrameSwiftShader: +msFrame.toFixed( 0 ), samples,
 		meanBounce0: m0.mean, meanBounce2: m2.mean, bouncesAddLight, finite, shownMean: +( shownSum / ( 3 * W * H ) ).toFixed( 3 ),

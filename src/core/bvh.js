@@ -36,6 +36,8 @@ const BINS = 12;
  * @param {Object} [options]
  * @param {number} [options.leafSize=1]   maximum items per leaf
  * @param {number} [options.maxDepth=40]  below this depth the builder stops splitting (bigger leaves instead)
+ * @param {boolean} [options.balanced=false]  split every node at the median of its longest centroid axis (depth ceil(log2 n)), no SAH:
+ *                                         for inputs whose boxes tie so that the SAH peels one item per level
  * @returns {BvhResult}
  */
 export function buildBvh( count, boxes, centroids, options = {} ) {
@@ -113,7 +115,7 @@ export function buildBvh( count, boxes, centroids, options = {} ) {
 
 		let bestCost = Infinity, bestBin = - 1;
 		let rx0 = Infinity, ry0 = Infinity, rz0 = Infinity, rx1 = - Infinity, ry1 = - Infinity, rz1 = - Infinity, rc = 0;
-		for ( let b = BINS - 1; b >= 1; b -- ) {
+		for ( let b = BINS - 1; b >= 1 && ! options.balanced; b -- ) {
 
 			const o = b * 3;
 			if ( binCount[ b ] ) { rx0 = Math.min( rx0, binMin[ o ] ); ry0 = Math.min( ry0, binMin[ o + 1 ] ); rz0 = Math.min( rz0, binMin[ o + 2 ] ); rx1 = Math.max( rx1, binMax[ o ] ); ry1 = Math.max( ry1, binMax[ o + 1 ] ); rz1 = Math.max( rz1, binMax[ o + 2 ] ); rc += binCount[ b ]; }

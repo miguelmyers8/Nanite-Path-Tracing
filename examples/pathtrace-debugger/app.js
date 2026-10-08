@@ -19,7 +19,13 @@ const params = new URLSearchParams( location.search );
 /** ?test: render offscreen (a headless WebGPU has no swap chain), run a few frames, verify, publish window.__gpuTest */
 const TEST = params.has( 'test' );
 
-const showError = ( msg ) => { ui.error.hidden = false; ui.error.textContent = String( msg ); if ( TEST ) window.__gpuTest = { done: true, ok: false, error: String( msg ) }; };
+const showError = ( msg ) => {
+
+	ui.error.hidden = false; ui.error.textContent = String( msg );
+	ui.pathBadge.textContent = 'error'; ui.pathBadge.className = 'badge bad';
+	if ( TEST ) window.__gpuTest = { done: true, ok: false, error: String( msg ) };
+
+};
 window.addEventListener( 'error', ( e ) => showError( `Error: ${ e.message }` ) );
 window.addEventListener( 'unhandledrejection', ( e ) => showError( `Unhandled: ${ e.reason?.stack || e.reason }` ) );
 const setStatus = ( t ) => { ui.status.textContent = t; };
@@ -32,12 +38,23 @@ const renderer = new THREE.WebGPURenderer( { antialias: false } );
 renderer.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) );
 renderer.setClearColor( 0x0b0e12, 1 );
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
+// pipeline compile and validation errors, uncaptured errors and a lost device (a driver reset) are reported by three through these hooks, which only
+// log by default: show them, or the canvas just goes black under a healthy-looking badge
+{
+
+	const onLost = renderer.onDeviceLost, onError = renderer.onError;
+	renderer.onDeviceLost = ( info ) => { onLost.call( renderer, info ); showError( `WebGPU device lost: ${ info.message || info.reason || 'unknown reason' }. Reload the page to start again.` ); };
+	renderer.onError = ( info ) => { onError.call( renderer, info ); showError( `WebGPU ${ info.type || 'error' }: ${ info.message || 'see the console' }` ); };
+
+}
 ui.view.prepend( renderer.domElement );
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera( 50, 1, 0.1, 400 );
 camera.position.set( 0, 7, 22 );
 const controls = new OrbitControls( camera, renderer.domElement );
+// a verification describes the view it was taken from
+controls.addEventListener( 'change', () => { if ( ! state.verifying ) { state.verifyResult = null; state.verifyError = null; } } );
 controls.enableDamping = true;
 controls.target.set( 0, 1, 0 );
 
@@ -104,7 +121,7 @@ function makePattern( name, size = 256 ) {
 const hexToRgb = ( hex ) => [ 1, 3, 5 ].map( ( i ) => parseInt( hex.slice( i, i + 2 ), 16 ) / 255 );
 const MAX_INSTANCES = 256;
 
-const state = { sets: null, scene: null, mesh: null, cull: null, tracer: null, materials: null, target: null, frameCount: 0, verifyResult: null, verifying: false, lastMs: 0 };
+const state = { sets: null, scene: null, mesh: null, cull: null, tracer: null, materials: null, target: null, frameCount: 0, verifyResult: null, verifyError: null, verifying: false, lastMs: 0, signature: '' };
 
 function normalizeGeometry( g ) {
 
@@ -253,7 +270,7 @@ function createTracer() {
 	const storageBufferLimit = limits?.maxStorageBuffersPerShaderStage ?? 8;
 	const maxPixels = maxFramePixels( renderer.backend?.device );
 	if ( ! state.tracer ) state.tracer = new PathTracePass( state.mesh, fw, fh, { materials: state.materials, maxBounces: parseInt( ui.bounces.value, 10 ), storageBufferLimit, maxPixels } );
-	else state.tracer.setSize( fw, fh );
+	else if ( state.tracer.setSize( fw, fh ) ) { state.verifyResult = null; state.verifyError = null; }
 	state.tracer.setDisplaySize( w, h );
 	if ( TEST ) { if ( state.target ) state.target.dispose(); state.target = new THREE.RenderTarget( w, h ); }
 	syncSceneStats();
@@ -277,20 +294,21 @@ const RASTER_VIEWS = { path: MeshletColorMode.MATERIAL, albedo: MeshletColorMode
 
 function applySettings() {
 
+	const ratio = parseFloat( ui.roughness.value ) / 0.5, floor = parseFloat( ui.metalness.value );
 	ui.thresholdVal.textContent = `${ thresholdPx().toFixed( 1 ) } px`;
 	ui.bouncesVal.textContent = ui.bounces.value; ui.sppVal.textContent = ui.spp.value;
 	ui.scaleVal.textContent = parseFloat( ui.scale.value ).toFixed( 2 ); ui.splitVal.textContent = `${ ui.split.value } %`;
 	ui.sunSizeVal.textContent = `${ parseFloat( ui.sunSize.value ).toFixed( 2 ) }°`; ui.exposureVal.textContent = parseFloat( ui.exposure.value ).toFixed( 2 );
 	ui.sunVal.textContent = `${ ui.sun.value }°`; ui.sunElevationVal.textContent = `${ ui.sunElevation.value }°`;
-	ui.roughnessVal.textContent = parseFloat( ui.roughness.value ).toFixed( 2 ); ui.metalnessVal.textContent = parseFloat( ui.metalness.value ).toFixed( 2 );
+	ui.roughnessVal.textContent = `×${ ratio.toFixed( 2 ) }`; ui.metalnessVal.textContent = floor.toFixed( 2 );
 	const t = state.tracer, mesh = state.mesh;
 	if ( ! t ) return;
 	const view = ui.viewMode.value;
 	t.view = VIEWS[ view ] ?? PathTraceView.PATH;
 	t.maxBounces = parseInt( ui.bounces.value, 10 );
-	t.samplesPerFrame = parseInt( ui.spp.value, 10 );
+	t.samplesPerFrame = parseInt( ui.spp.value, 10 );          // only how many samples a frame adds
 	t.sunAngularRadius = parseFloat( ui.sunSize.value ) * Math.PI / 180;
-	t.exposure = parseFloat( ui.exposure.value );
+	t.exposure = parseFloat( ui.exposure.value );              // only the display's multiplier
 	t.cullBackFaces = ui.cullBack.checked;
 	t.lodThreshold = thresholdPx();
 	state.cull.lodThreshold = thresholdPx();
@@ -298,9 +316,11 @@ function applySettings() {
 	mesh.lighting = view === 'path' ? LightingModel.PHYSICAL : view === 'albedo' ? LightingModel.UNLIT : LightingModel.SIMPLE;
 	const a = parseFloat( ui.sun.value ) * Math.PI / 180, el = parseFloat( ui.sunElevation.value ) * Math.PI / 180;
 	mesh.setLightDirection( Math.cos( el ) * Math.cos( a ), Math.sin( el ), Math.cos( el ) * Math.sin( a ) );   // the tracer shares the mesh's lighting uniforms
-	const r = parseFloat( ui.roughness.value ) / 0.5, m = parseFloat( ui.metalness.value );
-	MATERIALS.forEach( ( d, i ) => state.materials.setSurface( i, Math.min( 1, d.roughness * r ), Math.min( 1, Math.max( d.metalness, m ) ) ) );
-	t.reset();
+	MATERIALS.forEach( ( d, i ) => state.materials.setSurface( i, Math.min( 1, d.roughness * ratio ), Math.min( 1, Math.max( d.metalness, floor ) ) ) );
+	// what the sum and a verification depend on: the tracer's own setters restart it for the settings they own, the light and the materials are
+	// shared uniforms it cannot see; exposure and samples per frame change neither
+	const signature = [ view, ui.sun.value, ui.sunElevation.value, ui.roughness.value, ui.metalness.value, thresholdPx(), ui.bounces.value, ui.sunSize.value, ui.cullBack.checked ].join( '|' );
+	if ( signature !== state.signature ) { state.signature = signature; t.reset(); state.verifyResult = null; state.verifyError = null; }
 
 }
 
@@ -310,7 +330,7 @@ async function verify() {
 
 	const t = state.tracer;
 	if ( ! t || state.verifying ) return;
-	state.verifying = true;
+	state.verifying = true; state.verifyError = null;
 	controls.enabled = false;                       // the comparison needs the camera still
 	t.jitter = false; t.reset();                    // rays through the pixel centres, as the CPU reference traces them
 	try {
@@ -340,7 +360,7 @@ async function verify() {
 
 		state.verifyResult = { compared, mismatches, hits, avgCost: costSum / WH, threshold: lod.threshold };
 
-	} catch ( err ) { console.warn( 'verify failed', err ); } finally {
+	} catch ( err ) { console.warn( 'verify failed', err ); state.verifyError = String( err && err.message || err ); } finally {
 
 		t.jitter = true; t.reset(); controls.enabled = true; state.verifying = false;
 
@@ -354,8 +374,9 @@ function syncGpuStats() {
 	if ( ! t ) return;
 	ui.gpuStats.innerHTML = `
 		<dt>Samples per pixel</dt><dd>${ fmt( t.sampleCount ) }</dd>
-		<dt>Frame</dt><dd>${ state.lastMs.toFixed( 1 ) } ms <span>· ${ t.width }×${ t.height } · ${ t.maxBounces } bounces</span></dd>
-		<dt>Primary hits GPU vs CPU</dt><dd class="${ v ? ( v.mismatches === 0 ? 'ok' : 'bad' ) : '' }">${ v ? ( v.mismatches === 0 ? `identical (${ fmt( v.compared ) } rays, ${ fmt( v.hits ) } hits)` : `${ fmt( v.mismatches ) } of ${ fmt( v.compared ) } differ` ) : '—' }</dd>
+		<dt>Traced frame</dt><dd>${ t.width }×${ t.height } <span>· ${ t.maxBounces } bounces</span></dd>
+		<dt>CPU submit time</dt><dd>${ state.lastMs.toFixed( 1 ) } ms <span>· the frame rate is in the corner</span></dd>
+		<dt>Primary hits GPU vs CPU</dt><dd class="${ v ? ( v.mismatches === 0 ? 'ok' : 'bad' ) : state.verifyError ? 'bad' : '' }">${ v ? ( v.mismatches === 0 ? `identical <span>(${ fmt( v.compared ) } rays, ${ fmt( v.hits ) } hits)</span>` : `${ fmt( v.mismatches ) } of ${ fmt( v.compared ) } differ` ) : state.verifyError ? `failed: ${ state.verifyError }` : '—' }</dd>
 		<dt>Traversal cost per primary ray</dt><dd>${ v ? `${ v.avgCost.toFixed( 1 ) } <span>nodes + triangles</span>` : '—' }</dd>`;
 
 }
@@ -383,6 +404,15 @@ function resize() {
 }
 
 new ResizeObserver( resize ).observe( ui.view );
+/** The device pixel ratio changes without the layout size changing when the window moves to another display. */
+function watchPixelRatio() {
+
+	if ( ! window.matchMedia ) return;
+	matchMedia( `(resolution: ${ window.devicePixelRatio }dppx)` ).addEventListener( 'change', () => { renderer.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) ); resize(); watchPixelRatio(); }, { once: true } );
+
+}
+
+watchPixelRatio();
 
 // --- frame --------------------------------------------------------------------------------------------------------
 
@@ -434,14 +464,16 @@ async function checkSplit() {
 
 	const w = state.target.width, h = state.target.height;
 	const px = await renderer.readRenderTargetPixelsAsync( state.target, 0, 0, w, h );
+	const stride = Math.ceil( w * 4 / 256 ) * 256;      // rows are padded to a multiple of 256 bytes
+	const at = ( x, y ) => { const i = y * stride + x * 4; return ( px[ i ] >> 2 ) << 16 | ( px[ i + 1 ] >> 2 ) << 8 | ( px[ i + 2 ] >> 2 ); };
 	const splitX = Math.round( parseFloat( ui.split.value ) / 100 * w );
 	if ( splitX <= 4 || splitX >= w - 4 ) return null;
 	// the most common colour of the left half is its background or its floor; a wiped half is one flat colour
 	const counts = new Map();
-	for ( let y = 0; y < h; y ++ ) for ( let x = 0; x < splitX; x ++ ) { const i = ( y * w + x ) * 4, key = ( px[ i ] >> 2 ) << 16 | ( px[ i + 1 ] >> 2 ) << 8 | ( px[ i + 2 ] >> 2 ); counts.set( key, ( counts.get( key ) || 0 ) + 1 ); }
+	for ( let y = 0; y < h; y ++ ) for ( let x = 0; x < splitX; x ++ ) { const k = at( x, y ); counts.set( k, ( counts.get( k ) || 0 ) + 1 ); }
 	let mode = 0, best = 0; for ( const [ k, c ] of counts ) if ( c > best ) { best = c; mode = k; }
 	const left = best / ( splitX * h );
-	let rightMode = 0; for ( let y = 0; y < h; y ++ ) for ( let x = splitX; x < w; x ++ ) { const i = ( y * w + x ) * 4; if ( ( ( px[ i ] >> 2 ) << 16 | ( px[ i + 1 ] >> 2 ) << 8 | ( px[ i + 2 ] >> 2 ) ) === mode ) rightMode ++; }
+	let rightMode = 0; for ( let y = 0; y < h; y ++ ) for ( let x = splitX; x < w; x ++ ) if ( at( x, y ) === mode ) rightMode ++;
 	return { splitX, leftSameAsMode: +left.toFixed( 3 ), rightSharesLeftMode: +( rightMode / ( ( w - splitX ) * h ) ).toFixed( 3 ), ok: left < 0.97 };
 
 }
@@ -451,8 +483,8 @@ async function boot() {
 	try {
 
 		const adapter = await navigator.gpu.requestAdapter();
-		// the cull kernel binds more storage buffers than WebGPU's guaranteed eight, and the traced frame (nine vec4 per pixel) a large one:
-		// ask the adapter for what it has, within sensible caps
+		// the traced frame is nine vec4 per pixel, so a large one needs more than WebGPU's default 128 MiB storage binding (the tracer's kernels
+		// bind seven storage buffers, within the guaranteed eight): ask the adapter for what it has, within sensible caps
 		if ( adapter && renderer.backend?.parameters ) renderer.backend.parameters.requiredLimits = {
 			maxStorageBuffersPerShaderStage: Math.min( 16, adapter.limits.maxStorageBuffersPerShaderStage ),
 			maxStorageBufferBindingSize: Math.min( 1073741824, adapter.limits.maxStorageBufferBindingSize ),

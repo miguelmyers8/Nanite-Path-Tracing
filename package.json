@@ -6,12 +6,15 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./core": "./src/core/index.js"
+    "./core": "./src/core/index.js",
+    "./*": "./src/*"
   },
   "scripts": {
     "dev": "npx --yes serve -l 8080 .",
     "test": "node --test test/*.test.mjs",
-    "gpu-test": "node scripts/gpu-test.mjs"
+    "gpu-test": "node scripts/gpu-test.mjs",
+    "build:artifact": "node scripts/build-artifact.mjs",
+    "test:artifact": "node scripts/build-artifact.mjs && node scripts/gpu-test.mjs \"/dist/pathtrace-debugger/preview.html?test=1&nomips=1\""
   },
   "keywords": [
     "three",

@@ -12,9 +12,10 @@
  * `albedo × lightColor`) and the hemisphere sky as the environment, samples
  * the next direction from a Lambert + GGX lobe pair, and accumulates the
  * radiance of `samplesPerFrame` paths into a per-pixel sum that the display
- * quad divides by the sample count. Moving the camera (or anything the cut
- * depends on) resets the sum: real time at one sample per pixel, converging
- * when still.
+ * quad divides by the sample count. Moving the camera, resizing and changing
+ * the pass's own settings reset the sum (real time at one sample per pixel,
+ * converging when still); the pass cannot see the instance matrices, the light
+ * or the materials change, so the caller calls `reset()` after changing them.
  *
  * Two kernels per bounce, wavefront style: the trace kernel traces the
  * path ray of every pixel (bounce 0 builds the camera ray) and records the
@@ -43,12 +44,13 @@
  * @module PathTracePass
  */
 
-import { Vector2, Vector3, Matrix4, StorageBufferAttribute, QuadMesh, MeshBasicNodeMaterial } from 'three/webgpu';
+import { Color, Vector2, Vector3, Matrix4, StorageBufferAttribute, QuadMesh, MeshBasicNodeMaterial } from 'three/webgpu';
 import {
 	Fn, If, Loop, Break, Discard, array, uniform, storage, instanceIndex, screenCoordinate, vec2, vec3, vec4, float, uint, int,
 	select, normalize, cross, dot, length, max, min, abs, sqrt, pow, sin, cos, clamp, mix, floor, floatBitsToUint, uintBitsToFloat, hash, step,
 } from 'three/tsl';
 import { META_STRIDE_VEC4, META_OWN_SPHERE, META_PARENT_SPHERE, META_LOD_INFO } from 'nanite/meshlets/MeshletMesh.js';
+import { simpleShade } from 'nanite/materials/Lighting.js';
 import {
 	buildAccel, buildInstanceTlas, meshBoxes, HIER_VEC4, CBVH_VEC4, TLAS_NODE_VEC4, TLAS_INSTANCE_VEC4, LEAF_BIT,
 } from '../core/accel.js';
@@ -67,6 +69,21 @@ export function maxFramePixels( device ) {
 	const l = device && device.limits;
 	const bytes = Math.min( l ? l.maxStorageBufferBindingSize : 134217728, l ? l.maxBufferSize : 268435456 );
 	return Math.max( 1, Math.floor( bytes / FRAME_BYTES_PER_PIXEL ) );
+
+}
+
+/**
+ * One PCG step on a uint variable node: advances the state and returns the float in [0, 1) it produced.
+ * The result is a variable assigned here, in statement order. A bare expression would be inlined where it is used, after any
+ * later state update, and every number drawn between two updates would read the same final state (identical jitter in x and y,
+ * a sun sample and a bounce direction on a one-dimensional curve): a test pins this (test/gpu/rand.html).
+ * @param {Node} state  a `uint( seed ).toVar()`
+ */
+export function pcgRand( state ) {
+
+	state.assign( state.mul( uint( 747796405 ) ).add( uint( 2891336453 ) ) );
+	const word = state.shiftRight( state.shiftRight( uint( 28 ) ).add( uint( 4 ) ) ).bitXor( state ).mul( uint( 277803737 ) );
+	return word.shiftRight( uint( 22 ) ).bitXor( word ).toFloat().mul( 1 / 4294967296 ).toVar();
 
 }
 
@@ -146,11 +163,12 @@ export class PathTracePass {
 			split: uniform( 0, 'float' ),      // viewport pixels from the left that show what was drawn underneath (the raster)
 			viewport: uniform( new Vector2( 1, 1 ) ), // the drawing buffer the display covers (the frame may be smaller: a resolution scale)
 			costMax: uniform( 400, 'float' ),
-			background: uniform( new Vector3( 0.043, 0.055, 0.07 ) ),
+			background: uniform( new Vector3().fromArray( new Color( 0x0b0e12 ).toArray() ) ),   // the page's clear colour, in the linear working space
 		};
 
 		/** the frame never holds more pixels than this (maxFramePixels( device )): a larger request is scaled down, keeping its shape */
 		this.maxPixels = Math.max( 1, options.maxPixels ?? Infinity );
+		this._jitter = true;
 		this._width = 0; this._height = 0; this.frameCount = 0; this.sampleCount = 0;
 		this._needsReset = true;
 		this.material = new MeshBasicNodeMaterial();
@@ -171,15 +189,16 @@ export class PathTracePass {
 	get view() { return this.uniforms.view.value; }
 	set lodThreshold( v ) { v = Math.max( 1e-6, v ); if ( v !== this.uniforms.lodThreshold.value ) { this.uniforms.lodThreshold.value = v; this.reset(); } }
 	get lodThreshold() { return this.uniforms.lodThreshold.value; }
-	set lodTest( v ) { this.uniforms.enableLod.value = v ? 1 : 0; this.reset(); }
+	set lodTest( v ) { const n = v ? 1 : 0; if ( n !== this.uniforms.enableLod.value ) { this.uniforms.enableLod.value = n; this.reset(); } }
 	get lodTest() { return this.uniforms.enableLod.value === 1; }
 	set forceLevel( v ) { if ( v !== this.uniforms.forceLevel.value ) { this.uniforms.forceLevel.value = v; this.reset(); } }
 	get forceLevel() { return this.uniforms.forceLevel.value; }
-	set jitter( v ) { this.uniforms.jitter.value = v ? 1 : 0; }
-	get jitter() { return this.uniforms.jitter.value === 1; }
-	set sunAngularRadius( v ) { this.uniforms.sunAngularRadius.value = Math.max( 0, v ); this.reset(); }
+	/** Random sub-pixel positions (the path view); the debug views always trace the pixel centre. */
+	set jitter( v ) { this._jitter = !! v; }
+	get jitter() { return this._jitter; }
+	set sunAngularRadius( v ) { v = Math.max( 0, v ); if ( v !== this.uniforms.sunAngularRadius.value ) { this.uniforms.sunAngularRadius.value = v; this.reset(); } }
 	get sunAngularRadius() { return this.uniforms.sunAngularRadius.value; }
-	set cullBackFaces( v ) { this.uniforms.cullBackFaces.value = v ? 1 : 0; this.reset(); }
+	set cullBackFaces( v ) { const n = v ? 1 : 0; if ( n !== this.uniforms.cullBackFaces.value ) { this.uniforms.cullBackFaces.value = n; this.reset(); } }
 	get cullBackFaces() { return this.uniforms.cullBackFaces.value === 1; }
 	set exposure( v ) { this.uniforms.exposure.value = v; }
 	get exposure() { return this.uniforms.exposure.value; }
@@ -231,6 +250,9 @@ export class PathTracePass {
 		this.buffers.frame = new StorageBufferAttribute( new Float32Array( n * 9 * 4 ), 4 );
 		this.frameNode = storage( this.buffers.frame, 'vec4', n * 9 );
 		this.pixelCount = n;
+		// the size is compiled into the kernels: release the pipelines of the ones this replaces
+		if ( this.traceKernel ) this.traceKernel.dispose();
+		if ( this.shadeKernel ) this.shadeKernel.dispose();
 		this._createKernels();
 		this.reset();
 		return true;
@@ -279,6 +301,7 @@ export class PathTracePass {
 
 		camera.updateMatrixWorld();
 		const u = this.uniforms;
+		const path = u.view.value === PathTraceView.PATH;
 		_m.copy( camera.matrixWorld );
 		if ( ! _m.equals( u.cameraWorld.value ) ) { u.cameraWorld.value.copy( _m ); this.reset(); }
 		u.cameraPosition.value.setFromMatrixPosition( camera.matrixWorld );
@@ -286,11 +309,11 @@ export class PathTracePass {
 		const tanHalf = Math.tan( fov / 2 ), aspect = this._width / this._height;
 		if ( tanHalf !== u.tanHalfFov.value || aspect !== u.aspect.value ) { u.tanHalfFov.value = tanHalf; u.aspect.value = aspect; this.reset(); }
 		if ( options.tlas !== false || ! this._tlas ) this.updateTlas();
+		u.jitter.value = path && this._jitter ? 1 : 0;
 		u.reset.value = this._needsReset ? 1 : 0;
 		if ( this._needsReset ) { this.sampleCount = 0; this._needsReset = false; }
 		u.frame.value = ( this.frameCount ++ ) >>> 0;
 		// one sample: the trace kernel then the shade kernel per bounce; a debug view traces the primary rays only
-		const path = u.view.value === PathTraceView.PATH;
 		const samples = path ? u.samplesPerFrame.value : 1, bounces = path ? u.maxBounces.value : 0;
 		for ( let s = 0; s < samples; s ++ ) {
 
@@ -312,7 +335,7 @@ export class PathTracePass {
 	/** Draw the accumulated image to the current render target (a full-screen quad; pixels left of `split` are discarded). */
 	render( renderer ) { this.quad.render( renderer ); }
 
-	dispose() { this.material.dispose(); this.buffers.frame?.dispose?.(); this.buffers.accel?.dispose?.(); this.buffers.tlas?.dispose?.(); }
+	dispose() { this.traceKernel?.dispose(); this.shadeKernel?.dispose(); this.material.dispose(); this.buffers.frame?.dispose?.(); this.buffers.accel?.dispose?.(); this.buffers.tlas?.dispose?.(); }
 
 	// --- kernels ------------------------------------------------------------------------------------------------------------
 
@@ -353,14 +376,7 @@ export class PathTracePass {
 
 		};
 
-		/** PCG hash step on a uint var; returns a float in [0, 1). */
-		const rand = ( state ) => {
-
-			state.assign( state.mul( uint( 747796405 ) ).add( uint( 2891336453 ) ) );
-			const word = state.shiftRight( state.shiftRight( uint( 28 ) ).add( uint( 4 ) ) ).bitXor( state ).mul( uint( 277803737 ) );
-			return word.shiftRight( uint( 22 ) ).bitXor( word ).toFloat().mul( 1 / 4294967296 );
-
-		};
+		const rand = pcgRand;
 
 		/** Orthonormal basis around a unit normal (Duff et al. 2017). */
 		const basis = ( nrm ) => {
@@ -411,7 +427,9 @@ export class PathTracePass {
 						const m0 = tlas.element( rb ), m1 = tlas.element( rb.add( uint( 1 ) ) ), m2 = tlas.element( rb.add( uint( 2 ) ) ), m3 = tlas.element( rb.add( uint( 3 ) ) );
 						const i0 = tlas.element( rb.add( uint( 4 ) ) ), i1 = tlas.element( rb.add( uint( 5 ) ) ), i2 = tlas.element( rb.add( uint( 6 ) ) ), i3 = tlas.element( rb.add( uint( 7 ) ) );
 						const rec = tlas.element( rb.add( uint( 8 ) ) );
-						const root = floatBitsToUint( rec.x ), maxScale = rec.y.toVar(), minScale = rec.z.toVar();
+						const rec2 = tlas.element( rb.add( uint( 9 ) ) );
+						// maxScale: the cut rule's (the largest column norm); pruneMax / pruneMin: bounds on the singular values, for the distance bounds of the prunes
+						const root = floatBitsToUint( rec.x ), maxScale = rec.y.toVar(), pruneMax = rec2.x.toVar(), pruneMin = rec2.y.toVar();
 						// the ray and the camera in object space (direction unnormalized: t is shared with world space)
 						const po = xform( i0, i1, i2, i3, ro ).toVar(), pd = xformDir( i0, i1, i2, rd ).toVar();
 						const pinv = invDir( pd ).toVar();
@@ -442,11 +460,11 @@ export class PathTracePass {
 										const h2 = accel.element( hb.add( uint( 2 ) ) ), h3 = accel.element( hb.add( uint( 3 ) ) );
 										// too fine: the largest parent error, projected at the nearest possible distance, is at or below the threshold
 										const nearD = boxDistance( h2.xyz, h3.xyz, camObj );
-										const nearW = max( minScale.mul( nearD ).sub( h3.w.mul( maxScale ) ), u.lodNear );
+										const nearW = max( pruneMin.mul( nearD ).sub( h3.w.mul( maxScale ) ), u.lodNear );
 										const parentUpper = h1.w.mul( errScale ).div( nearW );
 										// too coarse: the smallest own error, projected at the farthest possible distance, is above it
 										const farD = boxFarDistance( h2.xyz, h3.xyz, camObj );
-										const farW = max( maxScale.mul( farD ), u.lodNear );
+										const farW = max( pruneMax.mul( farD ), u.lodNear );
 										const ownLower = h2.w.mul( errScale ).div( farW );
 										If( parentUpper.lessThanEqual( u.lodThreshold ).or( ownLower.greaterThan( u.lodThreshold ) ), () => { visit.assign( uint( 0 ) ); } );
 
@@ -701,7 +719,7 @@ export class PathTracePass {
 							const D = a2.div( d.mul( d ).mul( PI ) );
 							const gv = nl.mul( sqrt( nv.mul( nv ).mul( a2.oneMinus() ).add( a2 ) ) ), gl = nv.mul( sqrt( nl.mul( nl ).mul( a2.oneMinus() ).add( a2 ) ) );
 							const V = float( 0.5 ).div( gv.add( gl ).max( 1e-5 ) );
-							const Fr = f0c.add( f0c.oneMinus().mul( pow( vh.oneMinus(), 5 ) ) );
+							const Fr = f0c.add( f0c.oneMinus().mul( pow( max( vh.oneMinus(), 0 ), 5 ) ) );   // vh can round above 1: a negative pow base is indeterminate
 							return diffuseColor.div( PI ).add( Fr.mul( D ).mul( V ) );
 
 						};
@@ -785,7 +803,14 @@ export class PathTracePass {
 
 					} );
 
-					If( done.equal( uint( 1 ) ), () => { frame.element( id ).addAssign( vec4( radiance, 1 ) ); } );
+					// a finished path joins the pixel's sum; a NaN or infinite sample (a rounding corner of a lobe) is dropped, and a huge one clamped
+					// below the half-float range of the output, so one bad sample cannot black out a pixel until the next reset
+					If( done.equal( uint( 1 ) ), () => {
+
+						const finite = max( max( abs( radiance.x ), abs( radiance.y ) ), abs( radiance.z ) ).lessThan( 1e30 );
+						frame.element( id ).addAssign( vec4( select( finite, min( radiance, vec3( 30000 ) ), vec3( 0 ) ), 1 ) );
+
+					} );
 					frame.element( id.add( uint( S_RAY ) ) ).assign( vec4( ro, uintBitsToFloat( done ) ) );
 					frame.element( id.add( uint( S_DIR ) ) ).assign( vec4( rd, uintBitsToFloat( rng ) ) );
 					frame.element( id.add( uint( S_THROUGHPUT ) ) ).assign( vec4( throughput, 0 ) );
@@ -810,7 +835,7 @@ export class PathTracePass {
 			If( u.view.equal( uint( PathTraceView.PATH ) ), () => {
 
 				const acc = frame.element( p );
-				color.assign( acc.xyz.div( max( acc.w, 1 ) ).mul( u.exposure ) );
+				color.assign( min( acc.xyz.div( max( acc.w, 1 ) ).mul( u.exposure ), vec3( 60000 ) ) );
 
 			} ).Else( () => {
 
@@ -844,18 +869,26 @@ export class PathTracePass {
 							.ElseIf( u.view.equal( uint( PathTraceView.TRIANGLE ) ), () => { col.assign( hashColor( cluster.mul( uint( mesh.meshletSet.options.maxTriangles ) ).add( tri ).toFloat().add( 1000000 ) ) ); } )
 							.Else( () => {
 
-								// ALBEDO: the material at the interpolated UV (explicit level: no derivatives in a branch)
+								// ALBEDO: the material at the interpolated UV, with a mip level from the pixel's footprint on the surface: a ray cone,
+								// the footprint width t × pixelAngle / cos, times the triangle's UV per world unit (explicit level: no derivatives in a branch)
 								if ( materials ) {
 
 									const uvc = f0.objectUV ? f0.objectUV.mul( w0 ).add( f1.objectUV.mul( bary.x ) ).add( f2.objectUV.mul( bary.y ) ) : vec2( 0 );
-									const g = vec2( 1e-9 );
-									col.assign( materials.albedo( uvc, materials.materialOf( inst ), [ g, g ], { level: true } ) );
+									const m0 = tlas.element( rb ), m1 = tlas.element( rb.add( uint( 1 ) ) ), m2 = tlas.element( rb.add( uint( 2 ) ) ), m3 = tlas.element( rb.add( uint( 3 ) ) );
+									const q0 = xform( m0, m1, m2, m3, f0.objectPosition ), q1 = xform( m0, m1, m2, m3, f1.objectPosition ), q2 = xform( m0, m1, m2, m3, f2.objectPosition );
+									const worldArea = length( cross( q1.sub( q0 ), q2.sub( q0 ) ) ).mul( 0.5 );
+									const e1 = f1.objectUV.sub( f0.objectUV ), e2 = f2.objectUV.sub( f0.objectUV );
+									const uvArea = abs( e1.x.mul( e2.y ).sub( e1.y.mul( e2.x ) ) ).mul( 0.5 );
+									const pixelAngle = u.tanHalfFov.mul( 2 ).div( u.height.toFloat() );
+									const footprint = bary.z.mul( pixelAngle ).div( max( abs( dot( ng, rd ) ), 0.05 ) );
+									const f = footprint.mul( sqrt( uvArea.div( max( worldArea, 1e-12 ) ) ) );
+									col.assign( materials.albedo( uvc, materials.materialOf( inst ), [ vec2( f, 0 ), vec2( 0, f ) ], { level: true } ) );
 
 								} else col.assign( lit.flatColor );
 
 							} );
-						// a touch of shading so shapes read (the raster debuggers' simple factor), not on the normal view
-						const shade = select( u.view.equal( uint( PathTraceView.NORMAL ) ), float( 1 ), abs( dot( ns, lit.lightDirection ) ).mul( 0.65 ).add( 0.35 ) );
+						// the raster's own simple factor (the same function, so the halves of a split agree), none on the unlit albedo view
+						const shade = select( u.view.equal( uint( PathTraceView.ALBEDO ) ), float( 1 ), simpleShade( lit, dot( ns, lit.lightDirection ) ) );
 						color.assign( col.mul( shade ) );
 
 					} );

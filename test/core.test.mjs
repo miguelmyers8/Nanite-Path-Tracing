@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { lodSelected } from 'nanite/meshlets/core.js';
 import {
 	buildBvh, buildAccel, buildInstanceTlas, meshBoxes, traceRay, traceRayBruteForce, cameraRay,
-	HIER_VEC4, CBVH_VEC4, TLAS_INSTANCE_VEC4, LEAF_BIT, STACK_HIERARCHY, STACK_CLUSTER,
+	HIER_VEC4, CBVH_VEC4, TLAS_NODE_VEC4, TLAS_INSTANCE_VEC4, LEAF_BIT, STACK_HIERARCHY, STACK_CLUSTER, STACK_TLAS,
 } from '../src/core/index.js';
 import { makeTorus, makeSphere, makeLodSet, makePlainSet, compose, lookAt } from './helpers.mjs';
 
@@ -304,5 +304,89 @@ test( 'traceRay: a set without a DAG traces every cluster; lodTest off ignores t
 	assert.ok( r.hits > 0 );
 	const r2 = rayGrid( ctx, cam, { ...lod, lodTest: false }, 16 );
 	assert.equal( r2.hits, r.hits );
+
+} );
+
+// --- regressions from the independent review -------------------------------------------------------------------------------
+
+/** Column-major rotation about z, and a diagonal scale. */
+const rotZ = ( a ) => new Float32Array( [ Math.cos( a ), Math.sin( a ), 0, 0, - Math.sin( a ), Math.cos( a ), 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 ] );
+const diag = ( x, y, z ) => new Float32Array( [ x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1 ] );
+const withTranslation = ( m, x, y, z ) => { const o = new Float32Array( m ); o[ 12 ] = x; o[ 13 ] = y; o[ 14 ] = z; return o; };
+
+test( 'the hierarchy prunes stay sound when the instance matrix has non-orthogonal columns (non-uniform mesh scale over a rotated instance)', () => {
+
+	const set = makeLodSet( makeTorus() );
+	const accel = buildAccel( set );
+	const pixelScale = 1080 / ( 2 * Math.tan( 25 * Math.PI / 180 ) );
+	const build = ( model, instances ) => {
+
+		const matrices = new Float32Array( instances.length * 16 ); instances.forEach( ( m, i ) => matrices.set( m, i * 16 ) );
+		return { set, accel, tlas: buildInstanceTlas( { instanceCount: instances.length, instanceMatrices: matrices, modelMatrix: model, meshes: [ { first: 0, count: set.meshletCount } ], meshBox: meshBoxes( set ), meshRoot: accel.meshRoot } ) };
+
+	};
+
+	// the review's failing ray: mesh scale (2, 1, 1) over an instance rotated 45 degrees about z, camera far on +x
+	{
+
+		const ctx = build( diag( 2, 1, 1 ), [ rotZ( Math.PI / 4 ) ] );
+		const eye = [ 24.9163, 0.585, - 1.8192 ], dir = [ - 0.996033, - 0.040264, 0.079352 ];
+		const lod = { cameraPosition: eye, pixelScale, threshold: 0.5, near: 0.1 };
+		sameHit( traceRay( ctx, eye, dir, lod ), traceRayBruteForce( ctx, eye, dir, lod ), 'the review ray' );
+
+	}
+
+	// a sweep: several non-orthogonal matrices (anisotropic model scale x rotation, a shear), cameras, thresholds
+	let rays = 0, hits = 0;
+	for ( const [ model, inst ] of [ [ diag( 2, 1, 1 ), rotZ( 0.8 ) ], [ diag( 1, 3, 0.5 ), withTranslation( rotZ( 2.1 ), 1, 0, 0 ) ], [ diag( 0.4, 1, 2 ), rotZ( - 0.6 ) ], [ new Float32Array( [ 1, 0, 0, 0, 0.7, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 ] ), rotZ( 0.3 ) ] ] ) {
+
+		const ctx = build( model, [ inst, withTranslation( inst, 6, 1, - 2 ) ] );
+		for ( const eye of [ [ 5, 4, 9 ], [ 24, 1, - 2 ], [ - 14, 6, 3 ], [ 2, 30, 1 ], [ 60, 10, 60 ] ] ) for ( const threshold of [ 0.5, 1, 3 ] ) {
+
+			const cam = lookAt( eye, [ 3, 0, - 1 ] ), lod = { cameraPosition: eye, pixelScale, threshold, near: 0.1 };
+			for ( let j = 0; j < 12; j ++ ) for ( let i = 0; i < 12; i ++ ) {
+
+				const { origin, direction } = cameraRay( cam, 50 * Math.PI / 180, 64, 48, i * 5.3 + 0.4, j * 4 + 0.7 );
+				const a = traceRay( ctx, origin, direction, lod ), b = traceRayBruteForce( ctx, origin, direction, lod );
+				sameHit( a, b, `non-orthogonal ${ eye } ${ threshold } ray ${ i },${ j }` ); rays ++; if ( a ) hits ++;
+
+			}
+
+		}
+
+	}
+
+	assert.ok( hits > rays * 0.05, `the sweep hits the meshes: ${ hits } of ${ rays }` );
+
+} );
+
+test( 'builders reject or survive what the order table and the stacks cannot hold', () => {
+
+	// a cluster with more than 256 triangles does not fit a byte index
+	const big = makePlainSet( makeSphere( 64, 48, 1 ), { maxTriangles: 400, maxVertices: 256 } );
+	assert.ok( Math.max( ...Array.from( { length: big.meshletCount }, ( _, c ) => big.meshlets[ c * 4 + 3 ] ) ) > 256, 'the fixture has a cluster over 256 triangles' );
+	assert.throws( () => buildAccel( big ), /256 triangles/ );
+
+	// an empty cluster is skipped, not encoded as an internal node, and its neighbours still trace
+	const set = makePlainSet( makeTorus( 16, 32 ) );
+	const empty = { ...set, meshlets: new Uint32Array( set.meshlets ), meshletCount: set.meshletCount };
+	empty.meshlets[ 3 ] = 0;                                          // cluster 0 loses its triangles
+	const accel = buildAccel( empty );
+	const A = accel.data, AU = new Uint32Array( A.buffer ), L = accel.layout;
+	let leaves = 0, sawEmpty = false;
+	for ( let i = 0; i < L.hierarchyNodeCount; i ++ ) { const w = AU[ ( L.hierarchyBase + i * HIER_VEC4 ) * 4 + 3 ]; if ( w & LEAF_BIT ) { leaves ++; if ( ( w & 0x7fffffff ) === 0 ) sawEmpty = true; } }
+	assert.equal( leaves, set.meshletCount - 1 ); assert.ok( ! sawEmpty );
+
+	// a mesh with no clusters at all is an error, not a crash deep in the emitter
+	assert.throws( () => buildAccel( { ...set, meshes: [ { first: 0, count: 0 } ], meshletCount: 0 } ), /no (non-empty )?clusters|empty/i );
+
+	// near-coincident instances: the TLAS stays shallow and every instance stays reachable
+	const n = 256, matrices = new Float32Array( n * 16 ); let seed = 5; const rnd = () => ( seed = ( seed * 1664525 + 1013904223 ) >>> 0 ) / 4294967296 - 0.5;
+	for ( let i = 0; i < n; i ++ ) matrices.set( withTranslation( diag( 1, 1, 1 ), rnd() * 2e-8, rnd() * 2e-8, rnd() * 2e-8 ), i * 16 );
+	const tlas = buildInstanceTlas( { instanceCount: n, instanceMatrices: matrices, meshes: [ { first: 0, count: 1 } ], meshBox: new Float32Array( [ - 1, - 1, - 1, 1, 1, 1 ] ), meshRoot: new Uint32Array( [ 0 ] ) } );
+	assert.ok( tlas.depth < STACK_TLAS, `TLAS depth ${ tlas.depth }` );
+	const reachable = new Set(), TU = new Uint32Array( tlas.data.buffer, tlas.data.byteOffset, tlas.data.length );
+	for ( let i = 0; i < tlas.nodeCount; i ++ ) { const w = TU[ i * TLAS_NODE_VEC4 * 4 + 3 ]; if ( w & LEAF_BIT ) reachable.add( w & 0x7fffffff ); }
+	assert.equal( reachable.size, n );
 
 } );

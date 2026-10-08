@@ -6,7 +6,9 @@
 |---|---|---|
 | 1 Acceleration structures | binned-SAH builder; a triangle BVH per cluster (leaves of four, an order byte per triangle); a hierarchy per mesh over every LOD level (one sub-tree per level joined at the top) with per-node largest parent error, smallest own error, the box of the LOD spheres and the largest parent radius; a per-frame CPU TLAS over instances with world and inverse matrices and scales; one packed vec4 buffer the kernel and the CPU twin both read | `src/core/` |
 | 2 The tracer | a trace kernel (camera ray at bounce 0, TLAS → hierarchy with the two prunes and the cut rule → cluster BVH → triangles through the mesh's corner fetch) and a shade kernel (material table or flat colour, GGX + Lambert, a shadow ray towards the sun disk, a sampled next direction with one-sample MIS over the lobes, Russian roulette) per bounce; the path state in the frame buffer between them; progressive accumulation; a display quad with the debug views drawn from the primary hit record; a split against the raster | `src/three/PathTracePass.js` |
-| 3 Validation | `node --test`: builders, layouts, hierarchy traversal equal to the brute force over the cut at many distances and thresholds, scenes with non-uniform scale, any-hit, forced levels, closed surfaces without cracks; headless WebGPU: the GPU's primary hits equal the CPU twin on every pixel, bounced frames finite, every view draws, the debugger's own verification | `test/`, `scripts/gpu-harness.mjs` |
+| 3 Validation | `node --test`: builders, layouts, hierarchy traversal equal to the brute force over the cut at many distances and thresholds, scenes with non-uniform scale, any-hit, forced levels, closed surfaces without cracks; headless WebGPU: the GPU's primary hits equal the CPU twin (the gate allows no mismatch; none measured, 6,912 pixels in the parity page, 3,072 sampled rays in the debugger), two bounces add light over none, the frame clamps to its pixel cap, the PCG helper gives independent numbers, the NORMAL, CLUSTER, LEVEL, INSTANCE, TRIANGLE, COST and ALBEDO views each cover the frame, the split keeps the raster | `test/`, `scripts/gpu-harness.mjs` |
+| 4 Artifact | `scripts/build-artifact.mjs`: the debugger and the pipeline as one self-contained folder (three from a pinned CDN build, addons vendored, the page reduced to head and body content), checked for bare specifiers and unresolved imports | `dist/pathtrace-debugger` |
+| 5 Independent review | six lenses (bundle contract, runtime and UI, UI logic, GPU real-hardware hazards, core soundness, docs accuracy) read and ran the work; 42 findings, among them the correlated random numbers, a select overflowing its panel, GPU failures not shown, a CPU time labelled as GPU time, prune bounds that assumed orthogonal instance matrices; all fixed or recorded below | `docs/research/02`, the tests |
 
 ## Open items
 
@@ -36,9 +38,15 @@
   threshold) would save traversal where the camera cannot tell.
 - **Denoising and upscaling.** None. three-gpu-pathtracer's OIDN and FSR
   hooks are the model.
-- **An artifact build.** The Nanite repository packages its debuggers as
-  self-contained folders for claude.ai Artifacts; this debugger loads the
-  pipeline from `node_modules` and would need the same vendoring.
+- **Known limits recorded by the review.** Rays that pass exactly through an
+  edge shared by two triangles miss both about once per million (the
+  Moller-Trumbore tests are not watertight: roughly one sparkle sample per
+  frame at 1 spp, gone within a few frames); a window resize or a scale change
+  recompiles the two kernels (debounced, the old pipelines released) because the
+  frame size is compiled in, where size-independent kernels over a fixed-capacity
+  buffer would not; the canvas path (HDR frame-buffer target, output pass) was
+  checked with an emulated swap chain, not on a real GPU; there are no real-GPU
+  timings, and nothing here says how fast it runs on one.
 
 ## What a production tracer has that this one does not
 

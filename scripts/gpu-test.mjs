@@ -4,7 +4,7 @@
  */
 import { runGpuPage } from './gpu-harness.mjs';
 
-const pages = process.argv.slice( 2 ).length ? process.argv.slice( 2 ) : [ '/test/gpu/tsl-smoke.html', '/test/gpu/pathtrace-parity.html', '/examples/pathtrace-debugger/?test=1&nomips=1' ];
+const pages = process.argv.slice( 2 ).length ? process.argv.slice( 2 ) : [ '/test/gpu/tsl-smoke.html', '/test/gpu/rand.html', '/test/gpu/pathtrace-parity.html', '/examples/pathtrace-debugger/?test=1&nomips=1' ];
 let failed = 0;
 for ( const p of pages ) {
 

@@ -54,8 +54,10 @@ export const HIER_VEC4 = 4;
 export const CBVH_VEC4 = 2;
 export const TABLE_VEC4 = 1;
 export const TLAS_NODE_VEC4 = 2;
-export const TLAS_INSTANCE_VEC4 = 9;
+export const TLAS_INSTANCE_VEC4 = 10;
 export const LEAF_BIT = 0x80000000;
+/** the TLAS traversal stack of the kernel and the CPU twin (trace.js STACK_TLAS) */
+const TLAS_STACK_DEPTH = 24;
 
 export const DEFAULT_ACCEL_OPTIONS = Object.freeze( {
 	/** triangles per cluster BVH leaf */
@@ -116,6 +118,8 @@ export function buildAccel( set, options = {} ) {
 	const n = set.meshletCount;
 	const lod = lodArrayOf( set );
 	const meshes = set.meshes || [ { first: 0, count: n } ];
+	// the order table stores a cluster's local triangle index in one byte
+	for ( let c = 0; c < n; c ++ ) if ( set.meshlets[ c * 4 + 3 ] > 256 ) throw new Error( `buildAccel: cluster ${ c } has ${ set.meshlets[ c * 4 + 3 ] } triangles; the tracer supports at most 256 triangles per cluster (build the set with maxTriangles <= 256)` );
 
 	// --- 1. cluster BVHs -------------------------------------------------------------------------------------------------
 
@@ -248,16 +252,18 @@ function triangleOffsetOf( set, c ) {
 /** The hierarchy of one mesh (clusters [first, first + count)): a BVH per level, joined by a BVH over the level roots. */
 function buildMeshHierarchy( set, lod, clusterBox, first, count, opts, out ) {
 
-	// clusters per level
+	// clusters per level; a cluster without triangles has nothing to hit and is left out
 	const byLevel = new Map();
 	for ( let c = first; c < first + count; c ++ ) {
 
+		if ( set.meshlets[ c * 4 + 3 ] === 0 ) continue;
 		const L = lod[ c * 12 + 10 ] | 0;
 		if ( ! byLevel.has( L ) ) byLevel.set( L, [] );
 		byLevel.get( L ).push( c );
 
 	}
 
+	if ( byLevel.size === 0 ) throw new Error( `buildAccel: the mesh with clusters [${ first }, ${ first + count }) has no non-empty clusters` );
 	const levels = Array.from( byLevel.keys() ).sort( ( a, b ) => a - b );
 	const subtrees = [];
 	for ( const L of levels ) {
@@ -398,8 +404,12 @@ function buildMeshHierarchy( set, lod, clusterBox, first, count, opts, out ) {
  * Build the per-frame TLAS over the instances and pack it: nodes first, then one record per instance.
  *
  *   node (2 vec4): [min.xyz, word] [max.xyz, 0]; word bit 31 = leaf (low bits: instance index), else right child (left = node + 1)
- *   instance record (9 vec4) at instanceBase + i * 9: world matrix M (4 vec4, column-major), inverse(M) (4 vec4),
- *     [hierarchy root node, maxScale, minScale, mesh index]
+ *   instance record (10 vec4) at instanceBase + i * 10: world matrix M (4 vec4, column-major), inverse(M) (4 vec4),
+ *     [hierarchy root node, maxScale, minScale, mesh index], [pruneMax, pruneMin, 0, 0]
+ *     maxScale is the largest column norm of M, exactly what the cull kernel uses in the cut rule; pruneMax and pruneMin bound the
+ *     singular values of M (the most and the least a vector can be stretched), which the hierarchy prunes need: for orthogonal
+ *     columns they are the column norms, otherwise the Frobenius norms of M and of its inverse give safe bounds; both carry a
+ *     0.1 % margin so single-precision rounding at a prune boundary stays on the safe side
  *
  * @param {Object} params
  * @param {number} params.instanceCount
@@ -441,7 +451,10 @@ export function buildInstanceTlas( params, out = null ) {
 
 	}
 
-	const bvh = buildBvh( n, boxes, centroids, { leafSize: 1, maxDepth: 30 } );
+	// near-coincident instances tie their boxes, and the SAH then peels one per level: fall back to a balanced build when the stack would not hold
+	let bvh = buildBvh( n, boxes, centroids, { leafSize: 1, maxDepth: 64 } );
+	if ( bvh.depth >= TLAS_STACK_DEPTH - 1 ) bvh = buildBvh( n, boxes, centroids, { leafSize: 1, maxDepth: 64, balanced: true } );
+	if ( bvh.depth >= TLAS_STACK_DEPTH - 1 ) throw new Error( `buildInstanceTlas: ${ n } instances need a traversal stack of ${ bvh.depth + 2 }, the kernel has ${ TLAS_STACK_DEPTH }` );
 	const nodeCount = bvh.nodeCount;
 	const instanceBase = nodeCount * TLAS_NODE_VEC4;
 	const vec4Count = instanceBase + Math.max( 1, n ) * TLAS_INSTANCE_VEC4;
@@ -468,6 +481,23 @@ export function buildInstanceTlas( params, out = null ) {
 		const sx = Math.hypot( M[ m ], M[ m + 1 ], M[ m + 2 ] ), sy = Math.hypot( M[ m + 4 ], M[ m + 5 ], M[ m + 6 ] ), sz = Math.hypot( M[ m + 8 ], M[ m + 9 ], M[ m + 10 ] );
 		const k = instanceMesh ? instanceMesh[ i ] : 0;
 		u[ o + 32 ] = meshRoot[ k ]; data[ o + 33 ] = Math.max( sx, sy, sz ); data[ o + 34 ] = Math.min( sx, sy, sz ); u[ o + 35 ] = k;
+		// bounds on how much M can stretch or shrink a vector: the column norms when the columns are orthogonal (they are then the singular
+		// values), else the Frobenius norms of M and of its inverse (sigma_max <= |M|_F, sigma_min >= 1 / |M^-1|_F)
+		const d01 = M[ m ] * M[ m + 4 ] + M[ m + 1 ] * M[ m + 5 ] + M[ m + 2 ] * M[ m + 6 ];
+		const d02 = M[ m ] * M[ m + 8 ] + M[ m + 1 ] * M[ m + 9 ] + M[ m + 2 ] * M[ m + 10 ];
+		const d12 = M[ m + 4 ] * M[ m + 8 ] + M[ m + 5 ] * M[ m + 9 ] + M[ m + 6 ] * M[ m + 10 ];
+		const orthogonal = Math.abs( d01 ) <= 1e-4 * sx * sy && Math.abs( d02 ) <= 1e-4 * sx * sz && Math.abs( d12 ) <= 1e-4 * sy * sz;
+		let pruneMax, pruneMin;
+		if ( orthogonal ) { pruneMax = Math.max( sx, sy, sz ); pruneMin = Math.min( sx, sy, sz ); }
+		else {
+
+			pruneMax = Math.sqrt( sx * sx + sy * sy + sz * sz );
+			const invF = Math.sqrt( inv[ 0 ] * inv[ 0 ] + inv[ 1 ] * inv[ 1 ] + inv[ 2 ] * inv[ 2 ] + inv[ 4 ] * inv[ 4 ] + inv[ 5 ] * inv[ 5 ] + inv[ 6 ] * inv[ 6 ] + inv[ 8 ] * inv[ 8 ] + inv[ 9 ] * inv[ 9 ] + inv[ 10 ] * inv[ 10 ] );
+			pruneMin = invF > 0 ? 1 / invF : 0;
+
+		}
+
+		data[ o + 36 ] = pruneMax * 1.001; data[ o + 37 ] = pruneMin * 0.999; data[ o + 38 ] = 0; data[ o + 39 ] = 0;
 
 	}
 

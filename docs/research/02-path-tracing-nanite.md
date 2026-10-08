@@ -158,10 +158,12 @@ distance (otherwise an ancestor's level already covers it) and the smallest
 own error projects below it at the farthest (otherwise everything below is
 too coarse); at a cluster it applies the cull kernel's own test, with the
 error projected from the camera for every ray, so all rays see one
-crack-free surface identical to the raster cut. No per-frame build, no sort,
-nothing missing off screen. The tree holds every level, so it is about
-twice the cut's size, and each visited node costs a box distance and a
-divide.
+crack-free surface identical to the raster cut. No per-frame build over the
+geometry or the cut, no sort, nothing missing off screen. The tree holds every
+level, so it is about twice the finest level and many times the cut at a
+distance (the test torus has 299 clusters against 141, 75, 38, 21 and 10 in
+the cut at 4, 8, 16, 32 and 64 units, at 1 px), and each visited node costs a
+box distance and a divide.
 
 **(c) A proxy mesh** at a fixed error: trivial, wrong silhouettes; sensible
 as a far-field or GI representation later.
@@ -190,16 +192,26 @@ Measured in `test/gpu/pathtrace-parity.html` (headless Chrome, SwiftShader,
 four instances of two meshes, 401 clusters, 96 × 72): the GPU's primary
 hits (instance, cluster, triangle) equal the CPU reference on all 6,912
 pixels; the average primary ray tests 37 nodes and triangles; a 320 × 240
-frame with three bounces takes 1.5 s on SwiftShader (a CPU), the number to
-divide by a real GPU's throughput.
+frame with three bounces takes about 2 s on SwiftShader on a 4-core VM (a
+CPU: the number to divide by a real GPU's throughput, not a measurement of
+one).
 
 ## Lessons from the implementation
 
-- The two prunes must be conservative under non-uniform scale: the nearest
-  world distance is at least `minScale × distance(cameraObject, box) −
-  maxParentRadius × maxScale`, the farthest at most `maxScale × farDistance`;
-  the leaf test is then exact, in world space, with the same expressions as
-  the cull kernel, and the CPU twin calls Nanite's `lodSelected` itself.
+- The two prunes must be conservative under any instance matrix. The cut
+  rule's own terms keep the cull kernel's `maxScale` (the largest column norm
+  of the world matrix, which is also the radius scale), but the *distance*
+  bounds need the singular values: the nearest world distance is at least
+  `pruneMin × distance(cameraObject, box) − maxParentRadius × maxScale`, the
+  farthest at most `pruneMax × farDistance`. With orthogonal columns (any
+  translate-rotate-scale, mirrors included) the column norms are the singular
+  values; with a non-uniform mesh scale over a rotated instance they are not
+  (an independent review found the prunes dropping selected clusters: mesh
+  scale (2, 1, 1) over a 45-degree instance), so the TLAS record carries
+  `pruneMax = |M|_F` and `pruneMin = 1 / |M⁻¹|_F` for those, and a 0.1 %
+  margin for single-precision rounding at a boundary. The leaf test stays
+  exact, in world space, with the same expressions as the cull kernel, and
+  the CPU twin calls Nanite's `lodSelected` itself.
 - Every level of a torus has the same bounding box, so a top-level builder
   over level roots can put several levels in one leaf; the hierarchy
   emitter handles multi-item leaves with a chain of internal nodes, and the
@@ -215,6 +227,27 @@ divide by a real GPU's throughput.
   one region of a storage buffer: the per-pixel hit records are 16 bytes a
   pixel, read back for the parity check and the cost view without the
   colour sums.
+- A TSL helper that advances a state and returns an expression of it must
+  materialize the value (`.toVar()`): a bare expression is inlined where it is
+  used, after any later update, so every number drawn between two updates was
+  the same (jitter in x equal to jitter in y, a sun sample and a bounce
+  direction on a one-dimensional curve; the estimator converged to a line
+  integral, indirect light biased by several per cent). The parity tests
+  could not see it; a review that measured the kernel's output did, and
+  `test/gpu/rand.html` now runs the helper next to the lazy form to pin it.
+- A canvas paces the frame loop through its swap chain; rendering into a
+  render target does not, so on a software GPU the queue grows without bound
+  and every readback waits for all of it. The test mode keeps one frame in
+  flight (`queue.onSubmittedWorkDone`). `readRenderTargetPixelsAsync` pads
+  each row to 256 bytes.
+- Bounded and non-finite samples: a finished path whose radiance is NaN or
+  infinite is dropped, a huge one clamped below the half-float range of the
+  output, and the base of the Fresnel `pow` is clamped at zero, so one bad
+  sample cannot black out a pixel until the next reset.
+- Resolution, limits and the LOD pixel height are in the layout's pixels: the
+  raster and the tracer take the same height, so they choose the same cut at
+  any device pixel ratio, and the traced frame (144 bytes a pixel) is scaled
+  down to what the device's storage binding allows.
 
 ## Sources
 

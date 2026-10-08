@@ -1,0 +1,74 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>PCG random numbers</title>
+<script type="importmap">
+{ "imports": {
+	"three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+	"three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+	"three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
+	"nanite/": "../../node_modules/nanite/src/",
+	"nanite-path-tracing/": "../../src/"
+} }
+</script></head><body><pre id="out">running</pre>
+<script type="module">
+// The tracer draws several random numbers from one PCG state per bounce. A helper that returns a bare expression of the state is
+// inlined at its use, after the later updates, so every number drawn between two updates reads the same final state. This runs the
+// real helper (pcgRand) and, for contrast, that lazy form, on the GPU: the lazy numbers are identical, the real ones independent.
+import * as THREE from 'three/webgpu';
+import { Fn, storage, instanceIndex, uint, vec4 } from 'three/tsl';
+import { pcgRand } from 'nanite-path-tracing/three/PathTracePass.js';
+
+const out = document.getElementById( 'out' );
+const publish = ( r ) => { window.__gpuTest = { done: true, ...r }; out.textContent = JSON.stringify( r, null, 2 ); };
+try {
+
+	const renderer = new THREE.WebGPURenderer( { antialias: false } );
+	await renderer.init();
+	if ( ! renderer.backend.isWebGPUBackend ) throw new Error( 'no WebGPU backend' );
+	const N = 8192;
+
+	const lazyRand = ( state ) => {
+
+		state.assign( state.mul( uint( 747796405 ) ).add( uint( 2891336453 ) ) );
+		const word = state.shiftRight( state.shiftRight( uint( 28 ) ).add( uint( 4 ) ) ).bitXor( state ).mul( uint( 277803737 ) );
+		return word.shiftRight( uint( 22 ) ).bitXor( word ).toFloat().mul( 1 / 4294967296 );   // no .toVar(): inlined at the use
+
+	};
+
+	const run = async ( rand ) => {
+
+		const buf = new THREE.StorageBufferAttribute( new Float32Array( N * 4 ), 4 );
+		const node = storage( buf, 'vec4', N );
+		const kernel = Fn( () => {
+
+			const id = instanceIndex;
+			const state = id.add( uint( 1 ) ).mul( uint( 0x9E3779B9 ) ).toVar();
+			const a = rand( state ), b = rand( state ), c = rand( state ), d = rand( state );
+			node.element( id ).assign( vec4( a, b, c, d ) );
+
+		} )().compute( N, [ 64 ] );
+		renderer.compute( kernel );
+		const data = new Float32Array( await renderer.getArrayBufferAsync( buf ) );
+		let equalPairs = 0, pairs = 0, inRange = true, sum = 0;
+		const col = [ [], [], [], [] ];
+		for ( let i = 0; i < N; i ++ ) {
+
+			for ( let a = 0; a < 4; a ++ ) { const v = data[ i * 4 + a ]; if ( ! ( v >= 0 && v < 1 ) ) inRange = false; sum += v; col[ a ].push( v ); }
+			for ( let a = 0; a < 4; a ++ ) for ( let b = a + 1; b < 4; b ++ ) { pairs ++; if ( data[ i * 4 + a ] === data[ i * 4 + b ] ) equalPairs ++; }
+
+		}
+
+		const corr = ( x, y ) => { const n = x.length, mx = x.reduce( ( s, v ) => s + v, 0 ) / n, my = y.reduce( ( s, v ) => s + v, 0 ) / n; let sxy = 0, sxx = 0, syy = 0; for ( let i = 0; i < n; i ++ ) { sxy += ( x[ i ] - mx ) * ( y[ i ] - my ); sxx += ( x[ i ] - mx ) ** 2; syy += ( y[ i ] - my ) ** 2; } return sxy / Math.sqrt( sxx * syy || 1 ); };
+		let maxCorr = 0; for ( let a = 0; a < 4; a ++ ) for ( let b = a + 1; b < 4; b ++ ) maxCorr = Math.max( maxCorr, Math.abs( corr( col[ a ], col[ b ] ) ) );
+		return { equalPairFraction: +( equalPairs / pairs ).toFixed( 4 ), maxAbsCorrelation: +maxCorr.toFixed( 4 ), mean: +( sum / ( N * 4 ) ).toFixed( 4 ), inRange };
+
+	};
+
+	const real = await run( pcgRand ), lazy = await run( lazyRand );
+	publish( {
+		// the helper: independent, uniform; the lazy form: all four numbers identical (so this test does see the bug)
+		ok: real.inRange && real.equalPairFraction < 0.001 && real.maxAbsCorrelation < 0.1 && Math.abs( real.mean - 0.5 ) < 0.02 && lazy.equalPairFraction > 0.99,
+		real, lazy,
+	} );
+
+} catch ( e ) { publish( { ok: false, error: String( e.stack || e ) } ); }
+</script></body></html>
