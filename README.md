@@ -13,7 +13,7 @@ BVH over the instances is rebuilt each frame).
 | 1. Acceleration structures: triangle BVH per cluster, a hierarchy per mesh over every LOD level with the error bounds a ray prunes with, a per-frame instance TLAS, packed layouts, CPU reference traversal | done | `test/core.test.mjs` |
 | 2. The tracer: trace and shade compute kernels (camera rays, the cut chosen in the traversal, sun shadow rays, GGX + Lambert, hemisphere sky, progressive accumulation), display with debug views | done | `examples/pathtrace-debugger/` |
 | 3. Headless validation on SwiftShader: GPU primary hits against the CPU twin (0 mismatches required), the random numbers, bounces, every view, the debugger's own checks | done | `npm run gpu-test` |
-| 4. Packaging as a claude.ai Artifact: one self-contained folder, built and checked by a script | done | `npm run build:artifact` |
+| 4. Packaging as a claude.ai Artifact: one self-contained folder, built and checked by a script | done | `npm run build:artifact` · [live artifact](https://claude.ai/artifact/8kdoCQDBisnB7EH3ryVGu3) |
 
 ## The two questions this project started with
 
@@ -110,6 +110,20 @@ Storage buffers per kernel stay within WebGPU's guaranteed eight: accel,
 tlas, frame (colour sums, the primary hit record, the path state), and the
 mesh's meta, vertices, triangles, vertexData. Paged (compressed) and chunked
 (camera-relative) meshes are not supported yet.
+
+## The artifact
+
+`npm run build:artifact` writes `dist/pathtrace-debugger/`: `index.html` (the page
+content only, which the Artifact host wraps in its own document skeleton), `app.js`,
+this repository's `src/`, the pinned Nanite pipeline's `src/` as `nanite/`, and the three.js
+addons the page uses under `vendor/`. three.js itself loads from the pinned jsDelivr
+build. The script rewrites the bare `three`, `three/tsl`, `three/addons/...`, `nanite/...` and
+`nanite-path-tracing/...` imports (a published page has no import map) and fails when
+any import is left unresolved. `preview.html` is the same page inside a host-like
+skeleton for local runs; `npm run test:artifact` builds and runs it headless.
+The page needs a browser with WebGPU (Chrome, Edge); building the six meshes' LOD DAGs
+takes a few seconds on the main thread at load. It was checked headless with an
+emulated swap chain; it has not been timed on a real GPU.
 
 ## The Nanite repository
 
